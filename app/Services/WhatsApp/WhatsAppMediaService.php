@@ -16,8 +16,6 @@ class WhatsAppMediaService
     }
 
     /**
-     * Guarda comprobante desde mensaje entrante (Evolution o simulación).
-     *
      * @param  array<string, mixed>  $incoming
      */
     public function storeReceiptFromIncoming(WhatsappInstance $instance, array $incoming): ?MediaAsset
@@ -34,80 +32,155 @@ class WhatsAppMediaService
             return null;
         }
 
+        $inline = $this->extractInlineBase64($raw);
+        if ($inline) {
+            try {
+                return $this->storeFromBase64(
+                    $instance->tenant_id,
+                    $inline['base64'],
+                    'receipt-wa',
+                    $inline['mime']
+                );
+            } catch (Throwable $e) {
+                Log::warning('Inline base64 de comprobante inválido', ['error' => $e->getMessage()]);
+            }
+        }
+
         try {
-            $payload = $this->buildMediaPayload($raw);
-            if (empty(data_get($payload, 'message.key.id'))) {
-                Log::warning('Media sin key.id; no se puede descargar comprobante', [
-                    'keys' => array_keys($raw),
-                ]);
+            $payloads = $this->buildMediaPayloadVariants($raw);
+            $lastError = null;
 
-                return null;
+            foreach ($payloads as $payload) {
+                if (empty(data_get($payload, 'message.key.id'))) {
+                    continue;
+                }
+
+                try {
+                    $response = $this->evolution->getBase64FromMediaMessage(
+                        $instance->evolution_instance,
+                        $payload
+                    );
+
+                    $base64 = data_get($response, 'base64')
+                        ?? data_get($response, 'data.base64')
+                        ?? data_get($response, 'media.base64');
+
+                    if (! is_string($base64) || $base64 === '') {
+                        continue;
+                    }
+
+                    $mime = (string) (
+                        data_get($response, 'mimetype')
+                        ?? data_get($response, 'data.mimetype')
+                        ?? data_get($raw, 'message.imageMessage.mimetype')
+                        ?? data_get($raw, 'message.documentMessage.mimetype')
+                        ?? 'image/jpeg'
+                    );
+
+                    return $this->storeFromBase64($instance->tenant_id, $base64, 'receipt-wa', $mime);
+                } catch (Throwable $e) {
+                    $lastError = $e->getMessage();
+                }
             }
 
-            $response = $this->evolution->getBase64FromMediaMessage(
-                $instance->evolution_instance,
-                $payload
-            );
-
-            $base64 = data_get($response, 'base64')
-                ?? data_get($response, 'data.base64')
-                ?? data_get($response, 'media.base64');
-
-            if (! is_string($base64) || $base64 === '') {
-                Log::warning('Evolution no devolvió base64 del comprobante', [
-                    'response_keys' => is_array($response) ? array_keys($response) : [],
-                ]);
-
-                return null;
-            }
-
-            $mime = (string) (
-                data_get($response, 'mimetype')
-                ?? data_get($response, 'data.mimetype')
-                ?? data_get($raw, 'message.imageMessage.mimetype')
-                ?? 'image/jpeg'
-            );
-
-            return $this->storeFromBase64($instance->tenant_id, $base64, 'receipt-wa', $mime);
-        } catch (Throwable $e) {
             Log::warning('No se pudo descargar media de Evolution', [
+                'error' => $lastError,
+                'instance' => $instance->evolution_instance,
+                'has_key' => (bool) data_get($raw, 'key.id'),
+                'message_keys' => array_keys((array) data_get($raw, 'message', [])),
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('Error general al procesar comprobante', [
                 'error' => $e->getMessage(),
                 'instance' => $instance->evolution_instance,
             ]);
-
-            return null;
         }
+
+        return null;
     }
 
     /**
-     * Evolution v2 espera: { message: { key: { id, remoteJid, fromMe } }, convertToMp4: false }
-     *
      * @param  array<string, mixed>  $raw
-     * @return array<string, mixed>
+     * @return array{base64:string,mime:?string}|null
      */
-    private function buildMediaPayload(array $raw): array
+    private function extractInlineBase64(array $raw): ?array
     {
-        $key = data_get($raw, 'key')
-            ?? data_get($raw, 'data.key')
-            ?? data_get($raw, 'message.key')
-            ?? [];
+        $candidates = [
+            data_get($raw, 'message.base64'),
+            data_get($raw, 'base64'),
+            data_get($raw, 'data.base64'),
+            data_get($raw, 'msgContent'),
+            data_get($raw, 'message.imageMessage.base64'),
+            data_get($raw, 'message.documentMessage.base64'),
+        ];
 
+        foreach ($candidates as $value) {
+            if (! is_string($value) || strlen($value) < 200) {
+                continue;
+            }
+
+            $mime = null;
+            if (str_contains($value, 'base64,')) {
+                if (preg_match('/data:([^;]+);/', $value, $m)) {
+                    $mime = $m[1];
+                }
+            }
+
+            return ['base64' => $value, 'mime' => $mime];
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $raw
+     * @return list<array<string, mixed>>
+     */
+    private function buildMediaPayloadVariants(array $raw): array
+    {
+        $key = data_get($raw, 'key') ?? data_get($raw, 'data.key') ?? [];
         if (! is_array($key)) {
             $key = [];
         }
 
         $id = $key['id'] ?? data_get($raw, 'id') ?? data_get($raw, 'messageId');
+        if (! is_string($id) || $id === '') {
+            return [];
+        }
 
-        return [
-            'message' => [
-                'key' => array_filter([
-                    'remoteJid' => $key['remoteJid'] ?? data_get($raw, 'remoteJid'),
-                    'fromMe' => (bool) ($key['fromMe'] ?? false),
-                    'id' => is_string($id) ? $id : null,
-                ], fn ($v) => $v !== null && $v !== ''),
+        $remoteJid = $key['remoteJid'] ?? data_get($raw, 'remoteJid');
+        $fromMe = (bool) ($key['fromMe'] ?? false);
+        $messageBody = data_get($raw, 'message') ?? data_get($raw, 'data.message');
+
+        $keyFull = array_filter([
+            'remoteJid' => is_string($remoteJid) ? $remoteJid : null,
+            'fromMe' => $fromMe,
+            'id' => $id,
+            'participant' => $key['participant'] ?? null,
+        ], fn ($v) => $v !== null && $v !== '');
+
+        $variants = [
+            [
+                'message' => ['key' => $keyFull],
+                'convertToMp4' => false,
             ],
-            'convertToMp4' => false,
+            [
+                'message' => ['key' => ['id' => $id]],
+                'convertToMp4' => false,
+            ],
         ];
+
+        if (is_array($messageBody)) {
+            $variants[] = [
+                'message' => [
+                    'key' => $keyFull,
+                    'message' => $messageBody,
+                ],
+                'convertToMp4' => false,
+            ];
+        }
+
+        return $variants;
     }
 
     public function storeFromBase64(
@@ -124,8 +197,8 @@ class WhatsAppMediaService
         }
 
         $binary = base64_decode($base64, true);
-        if ($binary === false) {
-            throw new \RuntimeException('Base64 de comprobante inválido');
+        if ($binary === false || $binary === '') {
+            throw new \RuntimeException('Base64 de media inválido');
         }
 
         $mime = $mime ?: 'image/jpeg';
@@ -136,17 +209,10 @@ class WhatsAppMediaService
             default => 'jpg',
         };
 
-        $path = sprintf(
-            'receipts/%d/%s_%s.%s',
-            $tenantId,
-            $prefix,
-            Str::uuid(),
-            $ext
-        );
-
+        $path = sprintf('media/%d/%s_%s.%s', $tenantId, $prefix, Str::uuid(), $ext);
         Storage::disk('local')->put($path, $binary);
 
-        return MediaAsset::create([
+        $asset = MediaAsset::create([
             'tenant_id' => $tenantId,
             'disk' => 'local',
             'path' => $path,
@@ -154,19 +220,123 @@ class WhatsAppMediaService
             'size_bytes' => strlen($binary),
             'checksum' => hash('sha256', $binary),
         ]);
+
+        // Espejo en disco público (para sendMedia por URL)
+        $this->ensurePublicCopy($asset, $binary);
+
+        return $asset;
     }
 
     public function toDataUri(MediaAsset $asset): ?string
+    {
+        $binary = $this->readBinary($asset);
+
+        return $binary === null ? null : 'data:'.$asset->mime.';base64,'.base64_encode($binary);
+    }
+
+    public function toRawBase64(MediaAsset $asset): ?string
+    {
+        $binary = $this->readBinary($asset);
+
+        return $binary === null ? null : base64_encode($binary);
+    }
+
+    public function publicUrl(MediaAsset $asset): ?string
+    {
+        $binary = $this->readBinary($asset);
+        if ($binary === null) {
+            return null;
+        }
+
+        $publicPath = $this->ensurePublicCopy($asset, $binary);
+        if (! $publicPath) {
+            return null;
+        }
+
+        $base = rtrim((string) config('app.url'), '/');
+        if ($base === '') {
+            return null;
+        }
+
+        // Si APP_URL es localhost, Evolution Docker no lo alcanza → null (usará base64)
+        if (str_contains($base, '127.0.0.1') || str_contains($base, 'localhost')) {
+            return null;
+        }
+
+        return $base.'/storage/'.$publicPath;
+    }
+
+    /**
+     * Envía imagen a WhatsApp probando URL pública y base64.
+     *
+     * @return array<string, mixed>
+     */
+    public function sendImage(
+        EvolutionClient $evolution,
+        string $instance,
+        string $number,
+        MediaAsset $asset,
+        string $caption
+    ): array {
+        $fileName = 'qr-pago.'.(str_contains($asset->mime, 'png') ? 'png' : 'jpg');
+        $errors = [];
+
+        $url = $this->publicUrl($asset);
+        if ($url) {
+            try {
+                return $evolution->sendMedia($instance, $number, $url, 'image', $caption, $fileName, $asset->mime);
+            } catch (Throwable $e) {
+                $errors[] = 'url: '.$e->getMessage();
+            }
+        }
+
+        $raw = $this->toRawBase64($asset);
+        if ($raw) {
+            try {
+                return $evolution->sendMedia($instance, $number, $raw, 'image', $caption, $fileName, $asset->mime);
+            } catch (Throwable $e) {
+                $errors[] = 'raw64: '.$e->getMessage();
+            }
+        }
+
+        $dataUri = $this->toDataUri($asset);
+        if ($dataUri) {
+            try {
+                return $evolution->sendMedia($instance, $number, $dataUri, 'image', $caption, $fileName, $asset->mime);
+            } catch (Throwable $e) {
+                $errors[] = 'datauri: '.$e->getMessage();
+            }
+        }
+
+        throw new \RuntimeException('No se pudo enviar imagen: '.implode(' | ', $errors));
+    }
+
+    private function ensurePublicCopy(MediaAsset $asset, string $binary): ?string
+    {
+        $ext = str_contains($asset->mime, 'png') ? 'png' : (str_contains($asset->mime, 'webp') ? 'webp' : 'jpg');
+        $publicPath = sprintf('payment-qr/%d/%d.%s', $asset->tenant_id, $asset->id, $ext);
+
+        try {
+            if (! Storage::disk('public')->exists($publicPath)) {
+                Storage::disk('public')->put($publicPath, $binary);
+            }
+
+            return $publicPath;
+        } catch (Throwable $e) {
+            Log::warning('No se pudo copiar media a public', ['error' => $e->getMessage()]);
+
+            return null;
+        }
+    }
+
+    private function readBinary(MediaAsset $asset): ?string
     {
         if (! Storage::disk($asset->disk)->exists($asset->path)) {
             return null;
         }
 
         $binary = Storage::disk($asset->disk)->get($asset->path);
-        if ($binary === null || $binary === '') {
-            return null;
-        }
 
-        return 'data:'.$asset->mime.';base64,'.base64_encode($binary);
+        return ($binary === null || $binary === '') ? null : $binary;
     }
 }

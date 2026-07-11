@@ -182,7 +182,7 @@ class EvolutionClient
         return is_array($json) ? $json : ['raw' => $response->body()];
     }
 
-    private function http(): PendingRequest
+        private function http(): PendingRequest
     {
         return Http::timeout($this->timeout())
             ->acceptJson()
@@ -210,6 +210,7 @@ class EvolutionClient
 
     private function timeout(): float
     {
-        return (float) config('services.evolution.timeout', 30);
+        // Media (QR / comprobantes) necesita más tiempo que texto
+        return max((float) config('services.evolution.timeout', 30), 60);
     }
 }

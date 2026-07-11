@@ -616,6 +616,8 @@ class ConversationOrchestrator
             'status' => 'pending_payment',
         ]);
 
+        $qrAsset = $this->resolvePaymentQrAsset($instance->tenant_id, $course, $config);
+
         $payment = Payment::create([
             'tenant_id' => $instance->tenant_id,
             'sale_id' => $sale->id,
@@ -625,7 +627,7 @@ class ConversationOrchestrator
             'amount' => $course->price,
             'currency' => $course->currency,
             'qr_payload' => 'MANUAL-QR-'.$sale->uuid,
-            'qr_media_asset_id' => $course->payment_qr_media_asset_id,
+            'qr_media_asset_id' => $qrAsset?->id,
             'expires_at' => now()->addMinutes((int) ($config['ttl_minutes'] ?? 60)),
         ]);
 
@@ -636,32 +638,37 @@ class ConversationOrchestrator
             ."*Ref:* {$payment->idempotency_key}\n\n"
             .'Cuando pagues, envíame la *foto del comprobante* por aquí.';
 
-        $qrAsset = $course->paymentQr;
-        $mediaService = app(WhatsAppMediaService::class);
-        $dataUri = $qrAsset ? $mediaService->toDataUri($qrAsset) : null;
-
-        if ($dataUri) {
+        if ($qrAsset) {
             try {
-                $response = $this->evolution->sendMedia(
+                $response = app(WhatsAppMediaService::class)->sendImage(
+                    $this->evolution,
                     $instance->evolution_instance,
                     $phone,
-                    $dataUri,
-                    'image',
-                    $text,
-                    'qr-pago.'.(str_contains($qrAsset->mime, 'png') ? 'png' : 'jpg'),
-                    $qrAsset->mime
+                    $qrAsset,
+                    $text
                 );
                 $this->storeOutbound($instance, $conversation, $node->id, 'image', $text, $response);
             } catch (Throwable $e) {
-                Log::warning('No se pudo enviar imagen QR, fallback texto', ['error' => $e->getMessage()]);
-                $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
+                Log::error('Fallo envío QR imagen', ['error' => $e->getMessage(), 'asset_id' => $qrAsset->id]);
+                $this->sendOutbound(
+                    $instance,
+                    $conversation,
+                    $phone,
+                    $text."\n\n_(No pude adjuntar la imagen del QR. Revisa logs / APP_URL.)_",
+                    'text',
+                    $node->id
+                );
             }
         } else {
+            Log::warning('Curso sin imagen QR', [
+                'course_id' => $course->id,
+                'config_qr' => $config['qr_media_asset_id'] ?? null,
+            ]);
             $this->sendOutbound(
                 $instance,
                 $conversation,
                 $phone,
-                $text."\n\n_(Sube tu QR en Cursos para enviarlo como imagen.)_",
+                $text."\n\n_(Falta subir el QR: Dashboard → Cursos → Subir QR de cobro.)_",
                 'text',
                 $node->id
             );
@@ -675,6 +682,37 @@ class ConversationOrchestrator
                 'course_id' => $course->id,
             ]),
         ])->save();
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    private function resolvePaymentQrAsset(int $tenantId, Course $course, array $config): ?\App\Models\MediaAsset
+    {
+        $fromConfig = $config['qr_media_asset_id'] ?? null;
+        if ($fromConfig) {
+            $asset = \App\Models\MediaAsset::query()
+                ->where('tenant_id', $tenantId)
+                ->where('id', (int) $fromConfig)
+                ->first();
+            if ($asset) {
+                return $asset;
+            }
+        }
+
+        if ($course->paymentQr) {
+            return $course->paymentQr;
+        }
+
+        $other = Course::query()
+            ->where('tenant_id', $tenantId)
+            ->where('is_active', true)
+            ->whereNotNull('payment_qr_media_asset_id')
+            ->with('paymentQr')
+            ->orderByDesc('id')
+            ->first();
+
+        return $other?->paymentQr;
     }
 
     /**

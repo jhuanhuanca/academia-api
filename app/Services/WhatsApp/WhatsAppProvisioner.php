@@ -68,6 +68,24 @@ class WhatsAppProvisioner
             }
         }
 
+        // Asegura webhook con base64 aunque la instancia ya existiera
+        try {
+            $this->evolution->setWebhook($name, [
+                'enabled' => true,
+                'url' => $webhookUrl,
+                'byEvents' => false,
+                'base64' => true,
+                'events' => [
+                    'MESSAGES_UPSERT',
+                    'CONNECTION_UPDATE',
+                    'QRCODE_UPDATED',
+                    'SEND_MESSAGE',
+                ],
+            ]);
+        } catch (Throwable $e) {
+            Log::info('setWebhook refresh note', ['error' => $e->getMessage()]);
+        }
+
         $qr = null;
         try {
             $qr = $this->evolution->connect($name);

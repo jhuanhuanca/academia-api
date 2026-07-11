@@ -114,6 +114,16 @@ class IncomingMessageNormalizer
         $pushName = $item['pushName'] ?? data_get($item, 'message.pushName');
 
         $message = $item['message'] ?? [];
+
+        // Desenvuelve viewOnce / ephemeral (comprobantes a veces vienen así)
+        foreach (['viewOnceMessage', 'viewOnceMessageV2', 'ephemeralMessage', 'documentWithCaptionMessage'] as $wrap) {
+            $inner = data_get($message, $wrap.'.message');
+            if (is_array($inner)) {
+                $message = $inner;
+                break;
+            }
+        }
+
         $type = 'text';
         $body = null;
         $buttonId = null;
@@ -160,15 +170,31 @@ class IncomingMessageNormalizer
         } elseif (isset($message['documentMessage'])) {
             $type = 'document';
             $body = (string) ($message['documentMessage']['fileName'] ?? '[documento]');
+        } elseif (isset($message['stickerMessage'])) {
+            $type = 'image';
+            $body = '[sticker]';
         }
 
         // Algunos payloads Evolution v2 traen messageType + text fuera
-        if ($body === null && isset($item['messageType'])) {
-            $type = (string) $item['messageType'];
-            $body = data_get($item, 'message.conversation')
-                ?? data_get($item, 'text')
-                ?? null;
+        $messageType = (string) ($item['messageType'] ?? '');
+        if ($body === null && $messageType !== '') {
+            if (str_contains(strtolower($messageType), 'image')) {
+                $type = 'image';
+                $body = '[imagen]';
+            } elseif (str_contains(strtolower($messageType), 'document')) {
+                $type = 'document';
+                $body = '[documento]';
+            } else {
+                $type = $messageType;
+                $body = data_get($item, 'message.conversation')
+                    ?? data_get($item, 'text')
+                    ?? null;
+            }
         }
+
+        // Reinyecta message desenvuelto en raw para descarga de media
+        $itemForRaw = $item;
+        $itemForRaw['message'] = $message;
 
         return [
             'wa_message_id' => is_string($messageId) ? $messageId : null,
@@ -179,7 +205,7 @@ class IncomingMessageNormalizer
             'body' => $body,
             'button_id' => $buttonId !== '' ? $buttonId : null,
             'list_id' => $listId !== '' ? $listId : null,
-            'raw' => $item,
+            'raw' => $itemForRaw,
         ];
     }
 
