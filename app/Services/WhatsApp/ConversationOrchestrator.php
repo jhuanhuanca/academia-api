@@ -26,6 +26,7 @@ class ConversationOrchestrator
         private readonly EvolutionClient $evolution,
         private readonly FlowRunner $flowRunner,
         private readonly LunaClient $luna,
+        private readonly WhatsAppMediaService $mediaService,
     ) {
     }
 
@@ -643,7 +644,7 @@ class ConversationOrchestrator
 
         if ($qrAsset) {
             try {
-                $response = app(WhatsAppMediaService::class)->sendImage(
+                $response = $this->mediaService->sendImage(
                     $this->evolution,
                     $instance->evolution_instance,
                     $phone,
@@ -704,12 +705,12 @@ class ConversationOrchestrator
                 ->where('id', (int) $fromConfig)
                 ->first();
             if ($asset) {
-                return $asset;
+                return $this->mediaService->healPaymentQrAsset($asset);
             }
         }
 
         if ($course->paymentQr) {
-            return $course->paymentQr;
+            return $this->mediaService->healPaymentQrAsset($course->paymentQr);
         }
 
         $other = Course::query()
@@ -720,7 +721,11 @@ class ConversationOrchestrator
             ->orderByDesc('id')
             ->first();
 
-        return $other?->paymentQr;
+        if ($other?->paymentQr) {
+            return $this->mediaService->healPaymentQrAsset($other->paymentQr);
+        }
+
+        return null;
     }
 
     /**

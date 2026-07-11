@@ -44,9 +44,11 @@ class MediaAssetController extends Controller
         ], 201);
     }
 
-    public function show(Request $request, MediaAsset $mediaAsset): StreamedResponse|JsonResponse
+    public function show(Request $request, MediaAsset $mediaAsset, WhatsAppMediaService $mediaService): StreamedResponse|JsonResponse
     {
         abort_if($request->user()->tenant_id !== $mediaAsset->tenant_id, 404);
+
+        $mediaAsset = $mediaService->healPaymentQrAsset($mediaAsset);
 
         if (! Storage::disk($mediaAsset->disk)->exists($mediaAsset->path)) {
             return response()->json(['message' => 'Archivo no encontrado'], 404);

@@ -209,6 +209,27 @@ class WhatsAppMediaService
             default => 'jpg',
         };
 
+        // QR de cobro → disco public (payment-qr/...). Resto → local.
+        $isPaymentQr = str_starts_with($prefix, 'payment-qr') || $prefix === 'payment-qr';
+
+        if ($isPaymentQr) {
+            // Creamos el registro primero para usar el id en el path
+            $asset = MediaAsset::create([
+                'tenant_id' => $tenantId,
+                'disk' => 'public',
+                'path' => 'pending',
+                'mime' => $mime,
+                'size_bytes' => strlen($binary),
+                'checksum' => hash('sha256', $binary),
+            ]);
+
+            $path = sprintf('payment-qr/%d/%d.%s', $tenantId, $asset->id, $ext);
+            Storage::disk('public')->put($path, $binary);
+            $asset->update(['path' => $path]);
+
+            return $asset->fresh();
+        }
+
         $path = sprintf('media/%d/%s_%s.%s', $tenantId, $prefix, Str::uuid(), $ext);
         Storage::disk('local')->put($path, $binary);
 
@@ -221,7 +242,7 @@ class WhatsAppMediaService
             'checksum' => hash('sha256', $binary),
         ]);
 
-        // Espejo en disco público (para sendMedia por URL)
+        // Espejo público por si se necesita URL
         $this->ensurePublicCopy($asset, $binary);
 
         return $asset;
@@ -243,12 +264,15 @@ class WhatsAppMediaService
 
     public function publicUrl(MediaAsset $asset): ?string
     {
-        $binary = $this->readBinary($asset);
-        if ($binary === null) {
-            return null;
+        $publicPath = $this->resolvePublicPath($asset);
+        if (! $publicPath) {
+            $binary = $this->readBinary($asset);
+            if ($binary === null) {
+                return null;
+            }
+            $publicPath = $this->ensurePublicCopy($asset, $binary);
         }
 
-        $publicPath = $this->ensurePublicCopy($asset, $binary);
         if (! $publicPath) {
             return null;
         }
@@ -258,7 +282,6 @@ class WhatsAppMediaService
             return null;
         }
 
-        // Si APP_URL es localhost, Evolution Docker no lo alcanza → null (usará base64)
         if (str_contains($base, '127.0.0.1') || str_contains($base, 'localhost')) {
             return null;
         }
@@ -280,15 +303,15 @@ class WhatsAppMediaService
     ): array {
         $binary = $this->readBinary($asset);
         if ($binary === null) {
-            throw new \RuntimeException('Archivo QR no encontrado en disco (asset #'.$asset->id.')');
+            throw new \RuntimeException(
+                'Archivo QR no encontrado. Buscado en local y public/payment-qr/'.$asset->tenant_id.' (asset #'.$asset->id.')'
+            );
         }
 
-        // Evolution/Baileys convierte imágenes a JPEG con sharp
         $fileName = 'qr-pago.jpg';
         $mime = 'image/jpeg';
         $errors = [];
 
-        // 1) Multipart file — el camino más estable con Evolution Docker
         try {
             return $evolution->sendMediaFile(
                 $instance,
@@ -304,7 +327,6 @@ class WhatsAppMediaService
             Log::warning('sendMediaFile falló', ['error' => $e->getMessage()]);
         }
 
-        // 2) Base64 crudo (sin data URI)
         try {
             return $evolution->sendMedia(
                 $instance,
@@ -319,7 +341,6 @@ class WhatsAppMediaService
             $errors[] = 'raw64: '.$e->getMessage();
         }
 
-        // 3) URL pública (si APP_URL es alcanzable desde el contenedor)
         $url = $this->publicUrl($asset);
         if ($url) {
             try {
@@ -340,15 +361,41 @@ class WhatsAppMediaService
         throw new \RuntimeException('No se pudo enviar imagen: '.implode(' | ', $errors));
     }
 
+    /**
+     * Repara assets viejos: si el QR solo existe en public/payment-qr/{tenant}/{id}.*
+     * actualiza disk/path del MediaAsset.
+     */
+    public function healPaymentQrAsset(MediaAsset $asset): MediaAsset
+    {
+        if ($this->readBinary($asset) !== null) {
+            return $asset;
+        }
+
+        $found = $this->findPublicPaymentQrPath($asset->tenant_id, $asset->id);
+        if (! $found) {
+            return $asset;
+        }
+
+        $asset->forceFill([
+            'disk' => 'public',
+            'path' => $found,
+        ])->save();
+
+        Log::info('MediaAsset QR reparado hacia public', [
+            'asset_id' => $asset->id,
+            'path' => $found,
+        ]);
+
+        return $asset->fresh();
+    }
+
     private function ensurePublicCopy(MediaAsset $asset, string $binary): ?string
     {
         $ext = str_contains($asset->mime, 'png') ? 'png' : (str_contains($asset->mime, 'webp') ? 'webp' : 'jpg');
         $publicPath = sprintf('payment-qr/%d/%d.%s', $asset->tenant_id, $asset->id, $ext);
 
         try {
-            if (! Storage::disk('public')->exists($publicPath)) {
-                Storage::disk('public')->put($publicPath, $binary);
-            }
+            Storage::disk('public')->put($publicPath, $binary);
 
             return $publicPath;
         } catch (Throwable $e) {
@@ -358,14 +405,85 @@ class WhatsAppMediaService
         }
     }
 
-    private function readBinary(MediaAsset $asset): ?string
+    private function resolvePublicPath(MediaAsset $asset): ?string
     {
-        if (! Storage::disk($asset->disk)->exists($asset->path)) {
+        if ($asset->disk === 'public' && Storage::disk('public')->exists($asset->path)) {
+            return $asset->path;
+        }
+
+        return $this->findPublicPaymentQrPath($asset->tenant_id, $asset->id);
+    }
+
+    private function findPublicPaymentQrPath(int $tenantId, int $assetId): ?string
+    {
+        foreach (['jpg', 'jpeg', 'png', 'webp'] as $ext) {
+            $candidate = sprintf('payment-qr/%d/%d.%s', $tenantId, $assetId, $ext);
+            if (Storage::disk('public')->exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        // Cualquier archivo payment-qr/{tenant}/{id}*
+        $dir = sprintf('payment-qr/%d', $tenantId);
+        if (! Storage::disk('public')->exists($dir)) {
             return null;
         }
 
-        $binary = Storage::disk($asset->disk)->get($asset->path);
+        foreach (Storage::disk('public')->files($dir) as $file) {
+            $base = pathinfo($file, PATHINFO_FILENAME);
+            if ($base === (string) $assetId || str_starts_with($base, $assetId.'_')) {
+                return $file;
+            }
+        }
 
-        return ($binary === null || $binary === '') ? null : $binary;
+        return null;
+    }
+
+    private function readBinary(MediaAsset $asset): ?string
+    {
+        // 1) Path registrado en BD
+        try {
+            if ($asset->path && $asset->path !== 'pending' && Storage::disk($asset->disk)->exists($asset->path)) {
+                $binary = Storage::disk($asset->disk)->get($asset->path);
+                if (is_string($binary) && $binary !== '') {
+                    return $binary;
+                }
+            }
+        } catch (Throwable) {
+            // sigue con fallbacks
+        }
+
+        // 2) Copia en public/payment-qr/{tenant}/{id}.*
+        $publicPath = $this->findPublicPaymentQrPath($asset->tenant_id, $asset->id);
+        if ($publicPath) {
+            $binary = Storage::disk('public')->get($publicPath);
+            if (is_string($binary) && $binary !== '') {
+                return $binary;
+            }
+        }
+
+        // 3) Path local antiguo media/...
+        $legacyGuess = [
+            $asset->path,
+        ];
+        foreach (['jpg', 'jpeg', 'png', 'webp'] as $ext) {
+            $legacyGuess[] = sprintf('media/%d/payment-qr_%s.%s', $asset->tenant_id, $asset->id, $ext);
+        }
+        foreach ($legacyGuess as $guess) {
+            if (! is_string($guess) || $guess === '') {
+                continue;
+            }
+            try {
+                if (Storage::disk('local')->exists($guess)) {
+                    $binary = Storage::disk('local')->get($guess);
+                    if (is_string($binary) && $binary !== '') {
+                        return $binary;
+                    }
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return null;
     }
 }
