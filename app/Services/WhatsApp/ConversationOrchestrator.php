@@ -97,15 +97,32 @@ class ConversationOrchestrator
             ]);
 
             $flow = Flow::query()->findOrFail($conversation->flow_id);
-            $current = $conversation->current_node_id
-                ? FlowNode::query()->find($conversation->current_node_id)
-                : ($flow->start_node_id ? FlowNode::query()->find($flow->start_node_id) : null);
+            $current = $this->resolveFlowNode($flow, $conversation->current_node_id)
+                ?? $this->resolveStartNode($flow);
 
-            // Primera entrada: ejecutar desde start → nodos automáticos
-            if (! $conversation->current_node_id || ($current && $current->type === 'start')) {
-                $result = $this->runFromStart($instance, $conversation, $flow, $lead, $phone);
+            // Conversación trabada (pago/handoff) + saludo → reiniciar flujo
+            if (
+                $current
+                && in_array($conversation->status, ['waiting_payment', 'handed_off'], true)
+                && $this->looksLikeRestart((string) ($incoming['body'] ?? ''))
+            ) {
+                $conversation->forceFill([
+                    'status' => 'closed',
+                    'closed_at' => now(),
+                    'current_node_id' => null,
+                ])->save();
 
-                return $result;
+                $conversation = $this->resolveConversation($instance, $lead);
+                if (! $conversation) {
+                    return ['skipped' => true, 'reason' => 'no_flow_after_restart'];
+                }
+
+                return $this->runFromStart($instance, $conversation, $flow, $lead, $phone);
+            }
+
+            // Primera entrada o nodo start inválido/borrado → cadena desde inicio
+            if (! $current || $current->type === 'start') {
+                return $this->runFromStart($instance, $conversation, $flow, $lead, $phone);
             }
 
             $triggerType = 'default';
@@ -236,18 +253,93 @@ class ConversationOrchestrator
         Lead $lead,
         string $phone
     ): array {
-        $start = $flow->start_node_id
-            ? FlowNode::query()->find($flow->start_node_id)
-            : FlowNode::query()->where('flow_id', $flow->id)->where('type', 'start')->first();
+        $start = $this->resolveStartNode($flow);
 
         if (! $start) {
+            Log::warning('Flow sin nodo start', ['flow_id' => $flow->id]);
+
             return ['skipped' => true, 'reason' => 'no_start_node'];
         }
 
+        if ($flow->start_node_id !== $start->id) {
+            $flow->forceFill(['start_node_id' => $start->id])->save();
+        }
+
         $advanced = $this->flowRunner->advance($flow, $start, 'default', '');
-        $next = $advanced['node'] ?? $start;
+        $next = $advanced['node'] ?? null;
+
+        // Si no hay edge desde start (flujo mal guardado), buscar primer nodo útil
+        if (! $next || $next->id === $start->id || $next->type === 'start') {
+            $next = FlowNode::query()
+                ->where('flow_id', $flow->id)
+                ->whereIn('type', ['message', 'buttons', 'ai_reply', 'list'])
+                ->orderBy('id')
+                ->first();
+        }
+
+        if (! $next) {
+            $this->sendOutbound(
+                $instance,
+                $conversation,
+                $phone,
+                'Hola, aún no hay un flujo completo publicado. Revisa Flow Builder (Guardar + Publicar).',
+                'text',
+                $start->id
+            );
+
+            return ['skipped' => true, 'reason' => 'no_next_after_start'];
+        }
 
         return $this->executeNodeChain($instance, $conversation, $flow, $lead, $phone, $next);
+    }
+
+    private function resolveStartNode(Flow $flow): ?FlowNode
+    {
+        if ($flow->start_node_id) {
+            $byId = FlowNode::query()
+                ->where('flow_id', $flow->id)
+                ->where('id', $flow->start_node_id)
+                ->first();
+            if ($byId) {
+                return $byId;
+            }
+        }
+
+        return FlowNode::query()
+            ->where('flow_id', $flow->id)
+            ->where('type', 'start')
+            ->orderBy('id')
+            ->first();
+    }
+
+    private function resolveFlowNode(Flow $flow, ?int $nodeId): ?FlowNode
+    {
+        if (! $nodeId) {
+            return null;
+        }
+
+        return FlowNode::query()
+            ->where('flow_id', $flow->id)
+            ->where('id', $nodeId)
+            ->first();
+    }
+
+    private function looksLikeRestart(string $body): bool
+    {
+        $text = mb_strtolower(trim($body));
+        if ($text === '') {
+            return false;
+        }
+
+        $keys = ['hola', 'buenas', 'buen día', 'buen dia', 'menu', 'menú', 'inicio', 'reiniciar', 'empezar'];
+
+        foreach ($keys as $key) {
+            if ($text === $key || str_starts_with($text, $key.' ')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

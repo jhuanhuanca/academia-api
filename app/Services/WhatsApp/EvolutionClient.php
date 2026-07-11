@@ -11,7 +11,9 @@ class EvolutionClient
     public function health(): array
     {
         try {
-            $response = $this->http()->get('/');
+            // Debe usar la URL absoluta: Http::get('/') no incluye EVOLUTION_BASE_URL
+            // y el dashboard marcaba "Evolution down" aunque el contenedor estuviera OK.
+            $response = $this->http()->get(rtrim($this->baseUrl(), '/').'/');
 
             return [
                 'status' => $response->successful() ? 'ok' : 'down',

@@ -34,9 +34,9 @@ class DatabaseSeeder extends Seeder
 
         User::create([
             'tenant_id' => $tenant->id,
-            'name' => 'Admin MarketLuna',
-            'email' => 'admin@marketluna.local',
-            'password' => 'password',
+            'name' => 'Juan Huanca',
+            'email' => 'huancajuan863@gmail.com',
+            'password' => 'jhuanca1997@-luna',
             'role' => 'owner',
             'is_active' => true,
             'email_verified_at' => now(),
