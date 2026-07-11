@@ -474,7 +474,7 @@ class ConversationOrchestrator
 
         $out = [rtrim($text), '', 'Responde con el *número* o el nombre:'];
         $i = 1;
-        foreach (array_slice($buttons, 0, 3) as $b) {
+        foreach (array_slice($buttons, 0, 6) as $b) {
             $label = (string) ($b['label'] ?? $b['id'] ?? 'opción');
             $out[] = "*{$i})* {$label}";
             $i++;
@@ -578,6 +578,9 @@ class ConversationOrchestrator
     }
 
     /**
+     * Envía instrucciones de pago (QR imagen y/o texto con cuenta).
+     * El QR NO es obligatorio: Tigo/Yape/depósito solo envían datos y esperan comprobante.
+     *
      * @param  array<string, mixed>  $config
      */
     private function sendPaymentQr(
@@ -606,6 +609,10 @@ class ConversationOrchestrator
             return;
         }
 
+        $provider = (string) ($config['provider'] ?? 'manual_qr');
+        $wantsQrImage = $provider === 'manual_qr'
+            && (bool) ($config['send_qr_image'] ?? true);
+
         $sale = Sale::create([
             'tenant_id' => $instance->tenant_id,
             'uuid' => (string) Str::uuid(),
@@ -617,32 +624,27 @@ class ConversationOrchestrator
             'status' => 'pending_payment',
         ]);
 
-        $qrAsset = $this->resolvePaymentQrAsset($instance->tenant_id, $course, $config);
+        $qrAsset = $wantsQrImage
+            ? $this->resolvePaymentQrAsset($instance->tenant_id, $course, $config)
+            : null;
 
         $payment = Payment::create([
             'tenant_id' => $instance->tenant_id,
             'sale_id' => $sale->id,
-            'provider' => $config['provider'] ?? 'manual_qr',
+            'provider' => $provider,
             'idempotency_key' => (string) Str::uuid(),
             'status' => 'pending',
             'amount' => $course->price,
             'currency' => $course->currency,
-            'qr_payload' => 'MANUAL-QR-'.$sale->uuid,
+            'qr_payload' => strtoupper($provider).'-'.$sale->uuid,
             'qr_media_asset_id' => $qrAsset?->id,
             'expires_at' => now()->addMinutes((int) ($config['ttl_minutes'] ?? 60)),
         ]);
 
-        $caption = (string) ($config['caption'] ?? 'Escanea el QR para pagar.');
-        $text = "💳 *Pago pendiente*\n{$caption}\n\n"
-            ."*Curso:* {$course->title}\n"
-            ."*Monto:* {$course->price} {$course->currency}\n"
-            ."*Ref:* {$payment->idempotency_key}\n\n"
-            .'Cuando pagues, envíame la *foto del comprobante* por aquí.';
-
-        // Texto primero (siempre llega), imagen después
+        $text = $this->buildPaymentInstructionsText($course, $payment, $provider, $config);
         $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
 
-        if ($qrAsset) {
+        if ($wantsQrImage && $qrAsset) {
             try {
                 $response = $this->mediaService->sendImage(
                     $this->evolution,
@@ -668,7 +670,7 @@ class ConversationOrchestrator
                     $node->id
                 );
             }
-        } else {
+        } elseif ($wantsQrImage && ! $qrAsset) {
             Log::warning('Curso sin imagen QR', [
                 'course_id' => $course->id,
                 'config_qr' => $config['qr_media_asset_id'] ?? null,
@@ -677,7 +679,7 @@ class ConversationOrchestrator
                 $instance,
                 $conversation,
                 $phone,
-                '⚠️ Falta configurar la imagen QR: Dashboard → Cursos → Subir QR de cobro.',
+                '⚠️ Falta configurar la imagen QR: Dashboard → Cursos → Subir QR de cobro. Mientras tanto usa Tigo/Yape/Depósito.',
                 'text',
                 $node->id
             );
@@ -689,8 +691,54 @@ class ConversationOrchestrator
                 'sale_id' => $sale->id,
                 'payment_id' => $payment->id,
                 'course_id' => $course->id,
+                'payment_provider' => $provider,
             ]),
         ])->save();
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    private function buildPaymentInstructionsText(
+        Course $course,
+        Payment $payment,
+        string $provider,
+        array $config
+    ): string {
+        $methodLabel = match ($provider) {
+            'tigo_money' => 'Tigo Money',
+            'yape' => 'Yape',
+            'bank_deposit' => 'Depósito bancario',
+            'manual_qr' => 'QR de pago',
+            default => 'Pago',
+        };
+
+        $caption = trim((string) ($config['caption'] ?? ''));
+        $instructions = trim((string) ($config['instructions'] ?? ''));
+
+        if ($instructions === '') {
+            $instructions = match ($provider) {
+                'tigo_money' => "📱 *Tigo Money*\nNúmero: (configura tu número)\nNombre: (configura el titular)",
+                'yape' => "💜 *Yape*\nNúmero: (configura tu número)\nNombre: (configura el titular)",
+                'bank_deposit' => "🏦 *Depósito bancario*\nBanco: (configura)\nCuenta: (configura)\nTitular: (configura)",
+                default => 'Escanea el QR o paga con el método indicado.',
+            };
+        }
+
+        if ($caption === '') {
+            $caption = match ($provider) {
+                'manual_qr' => '¡Excelente decisión! Enseguida te envío el QR de pago.',
+                default => '¡Excelente decisión! Aquí tienes los datos para pagar con *'.$methodLabel.'*.',
+            };
+        }
+
+        return "💳 *Pago pendiente — {$methodLabel}*\n"
+            ."{$caption}\n\n"
+            ."{$instructions}\n\n"
+            ."*Curso:* {$course->title}\n"
+            ."*Monto:* {$course->price} {$course->currency}\n"
+            ."*Ref:* {$payment->idempotency_key}\n\n"
+            .'Cuando pagues, envíame la *foto del comprobante* por aquí para activar tu acceso ✅';
     }
 
     /**
