@@ -441,39 +441,49 @@ class ConversationOrchestrator
         array $config
     ): void {
         $text = (string) ($config['text'] ?? 'Elige una opción');
-        $buttons = $config['buttons'] ?? [];
-        $footer = $config['footer'] ?? 'MarketLuna';
-        $title = (string) ($config['title'] ?? 'Opciones');
+        $buttons = is_array($config['buttons'] ?? null) ? $config['buttons'] : [];
+        $footer = is_string($config['footer'] ?? null) ? $config['footer'] : 'MarketLuna';
+        $preferNative = (bool) ($config['native_buttons'] ?? false);
 
-        // Primera línea como título corto; el resto como descripción (estilo WhatsApp)
-        $lines = preg_split("/\r\n|\n|\r/", $text) ?: [$text];
-        $titleLine = trim((string) ($lines[0] ?? $title));
-        $description = count($lines) > 1
-            ? trim(implode("\n", array_slice($lines, 1)))
-            : $text;
+        // Baileys: los botones nativos suelen fallar en WhatsApp Web
+        // ("No se pudo cargar este mensaje"). Menú numerado = fiable.
+        if ($preferNative && $buttons !== []) {
+            $lines = preg_split("/\r\n|\n|\r/", $text) ?: [$text];
+            $titleLine = trim((string) ($lines[0] ?? 'Opciones'));
+            $description = count($lines) > 1
+                ? trim(implode("\n", array_slice($lines, 1)))
+                : $text;
 
-        try {
-            $response = $this->evolution->sendButtons(
-                $instance->evolution_instance,
-                $phone,
-                $titleLine !== '' ? $titleLine : $title,
-                $description !== '' ? $description : $text,
-                is_array($buttons) ? $buttons : [],
-                is_string($footer) ? $footer : 'MarketLuna'
-            );
-            $this->storeOutbound($instance, $conversation, $node->id, 'buttons', $text, $response);
-        } catch (Throwable $e) {
-            // Baileys a menudo no soporta botones nativos → menú numerado (sí funciona)
-            Log::warning('sendButtons failed, fallback menú numerado', ['error' => $e->getMessage()]);
-            $out = [rtrim($text), '', 'Responde con el número o el nombre:'];
-            $i = 1;
-            foreach ($buttons as $b) {
-                $label = (string) ($b['label'] ?? $b['id'] ?? 'opción');
-                $out[] = "{$i}) {$label}";
-                $i++;
+            try {
+                $response = $this->evolution->sendButtons(
+                    $instance->evolution_instance,
+                    $phone,
+                    $titleLine !== '' ? $titleLine : 'Opciones',
+                    $description !== '' ? $description : $text,
+                    $buttons,
+                    $footer
+                );
+                $this->storeOutbound($instance, $conversation, $node->id, 'buttons', $text, $response);
+
+                return;
+            } catch (Throwable $e) {
+                Log::warning('sendButtons nativo falló, usando menú texto', ['error' => $e->getMessage()]);
             }
-            $this->sendOutbound($instance, $conversation, $phone, implode("\n", $out), 'text', $node->id);
         }
+
+        $out = [rtrim($text), '', 'Responde con el *número* o el nombre:'];
+        $i = 1;
+        foreach (array_slice($buttons, 0, 3) as $b) {
+            $label = (string) ($b['label'] ?? $b['id'] ?? 'opción');
+            $out[] = "*{$i})* {$label}";
+            $i++;
+        }
+        if ($footer !== '') {
+            $out[] = '';
+            $out[] = "_ {$footer}_";
+        }
+
+        $this->sendOutbound($instance, $conversation, $phone, implode("\n", $out), 'text', $node->id);
     }
 
     /**
