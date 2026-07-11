@@ -191,13 +191,38 @@ class PaymentConfirmationService
 
     private function notifyOwnersByEmail(int $tenantId, Payment $payment): void
     {
+        $payment = $payment->fresh(['sale.lead', 'sale.course', 'receiptMedia']);
+
         $users = User::query()
             ->where('tenant_id', $tenantId)
             ->where('is_active', true)
             ->get();
 
-        if ($users->isEmpty()) {
-            Log::warning('No hay usuarios activos para notificar comprobante', [
+        $recipients = [];
+        foreach ($users as $user) {
+            if (is_string($user->email) && filter_var($user->email, FILTER_VALIDATE_EMAIL)) {
+                $recipients[strtolower($user->email)] = $user;
+            }
+        }
+
+        $extra = (string) config('services.payments.notify_emails', '');
+        foreach (preg_split('/[\s,;]+/', $extra) ?: [] as $email) {
+            $email = strtolower(trim($email));
+            if ($email === '' || ! filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                continue;
+            }
+            if (! isset($recipients[$email])) {
+                $fallbackUser = $users->first() ?? new User([
+                    'name' => 'Admin',
+                    'email' => $email,
+                    'tenant_id' => $tenantId,
+                ]);
+                $recipients[$email] = $fallbackUser;
+            }
+        }
+
+        if ($recipients === []) {
+            Log::warning('No hay destinatarios de email para el comprobante', [
                 'tenant_id' => $tenantId,
                 'payment_id' => $payment->id,
             ]);
@@ -205,16 +230,23 @@ class PaymentConfirmationService
             return;
         }
 
-        $confirmUrl = url('/confirmar-pago/'.$payment->id.'?token='.$payment->confirmation_token);
+        $confirmUrl = rtrim((string) config('app.url'), '/').'/confirmar-pago/'.$payment->id.'?token='.$payment->confirmation_token;
 
-        foreach ($users as $user) {
+        foreach ($recipients as $email => $user) {
             try {
-                Mail::to($user->email)->send(new PaymentReceiptReviewMail($payment, $user, $confirmUrl));
+                Mail::to($email)->send(new PaymentReceiptReviewMail($payment, $user, $confirmUrl));
+                Log::info('Email de comprobante enviado', [
+                    'payment_id' => $payment->id,
+                    'email' => $email,
+                    'confirm_url' => $confirmUrl,
+                ]);
             } catch (Throwable $e) {
                 Log::error('Error enviando email de comprobante', [
                     'payment_id' => $payment->id,
-                    'email' => $user->email,
+                    'email' => $email,
                     'error' => $e->getMessage(),
+                    'mailer' => config('mail.default'),
+                    'from' => config('mail.from.address'),
                 ]);
             }
         }

@@ -10,7 +10,9 @@ use Illuminate\Mail\Mailables\Attachment;
 use Illuminate\Mail\Mailables\Content;
 use Illuminate\Mail\Mailables\Envelope;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Throwable;
 
 class PaymentReceiptReviewMail extends Mailable
 {
@@ -53,15 +55,51 @@ class PaymentReceiptReviewMail extends Mailable
     public function attachments(): array
     {
         $media = $this->payment->receiptMedia;
-        if (! $media || ! Storage::disk($media->disk)->exists($media->path)) {
+        if (! $media) {
             return [];
         }
 
-        return [
-            Attachment::fromStorageDisk($media->disk, $media->path)
-                ->as('comprobante.'.$this->extensionForMime($media->mime))
-                ->withMime($media->mime),
-        ];
+        try {
+            $disk = $media->disk ?: 'public';
+            $path = $media->path;
+
+            if (! $path || $path === 'pending' || ! Storage::disk($disk)->exists($path)) {
+                // Fallback típico en VPS: receipts/{tenant}/{id}.*
+                foreach (['jpg', 'jpeg', 'png', 'webp', 'pdf'] as $ext) {
+                    $guess = sprintf('receipts/%d/%d.%s', $media->tenant_id, $media->id, $ext);
+                    if (Storage::disk('public')->exists($guess)) {
+                        $disk = 'public';
+                        $path = $guess;
+                        break;
+                    }
+                }
+            }
+
+            if (! $path || ! Storage::disk($disk)->exists($path)) {
+                Log::warning('Email sin adjunto: archivo de comprobante no encontrado', [
+                    'payment_id' => $this->payment->id,
+                    'media_id' => $media->id,
+                    'disk' => $media->disk,
+                    'path' => $media->path,
+                ]);
+
+                return [];
+            }
+
+            return [
+                Attachment::fromStorageDisk($disk, $path)
+                    ->as('comprobante.'.$this->extensionForMime($media->mime ?: 'image/jpeg'))
+                    ->withMime($media->mime ?: 'image/jpeg'),
+            ];
+        } catch (Throwable $e) {
+            // El correo debe salir aunque el adjunto falle
+            Log::warning('No se pudo adjuntar comprobante al email', [
+                'payment_id' => $this->payment->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
     }
 
     private function extensionForMime(string $mime): string

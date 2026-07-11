@@ -46,4 +46,14 @@ return [
     ],
 
     'frontend_url' => env('FRONTEND_URL', 'http://127.0.0.1:5173'),
+
+    'payments' => [
+        // Correos extra que siempre reciben comprobantes (separados por coma)
+        'notify_emails' => env('PAYMENT_NOTIFY_EMAILS', ''),
+    ],
+
+    'brevo' => [
+        // API key (xkeysib-...), NO la SMTP key. Se crea en Brevo → SMTP & API → API Keys
+        'key' => env('BREVO_API_KEY'),
+    ],
 ];
