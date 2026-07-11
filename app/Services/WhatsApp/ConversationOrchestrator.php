@@ -413,7 +413,7 @@ class ConversationOrchestrator
                 $instance,
                 $conversation,
                 $phone,
-                'Cuando completes el pago, avísame aquí. Estoy atento 👀',
+                'Cuando completes el pago, envíame la *foto del comprobante* por aquí 👀',
                 'text',
                 $node->id
             ),
@@ -443,24 +443,32 @@ class ConversationOrchestrator
         $text = (string) ($config['text'] ?? 'Elige una opción');
         $buttons = $config['buttons'] ?? [];
         $footer = $config['footer'] ?? 'MarketLuna';
+        $title = (string) ($config['title'] ?? 'Opciones');
+
+        // Primera línea como título corto; el resto como descripción (estilo WhatsApp)
+        $lines = preg_split("/\r\n|\n|\r/", $text) ?: [$text];
+        $titleLine = trim((string) ($lines[0] ?? $title));
+        $description = count($lines) > 1
+            ? trim(implode("\n", array_slice($lines, 1)))
+            : $text;
 
         try {
             $response = $this->evolution->sendButtons(
                 $instance->evolution_instance,
                 $phone,
-                'Luna',
-                $text,
-                $buttons,
+                $titleLine !== '' ? $titleLine : $title,
+                $description !== '' ? $description : $text,
+                is_array($buttons) ? $buttons : [],
                 is_string($footer) ? $footer : 'MarketLuna'
             );
             $this->storeOutbound($instance, $conversation, $node->id, 'buttons', $text, $response);
         } catch (Throwable $e) {
             Log::warning('sendButtons failed, fallback text', ['error' => $e->getMessage()]);
-            $lines = [$text, ''];
+            $out = [$text, ''];
             foreach ($buttons as $b) {
-                $lines[] = '• '.($b['label'] ?? $b['id'] ?? 'opción');
+                $out[] = '• '.($b['label'] ?? $b['id'] ?? 'opción');
             }
-            $this->sendOutbound($instance, $conversation, $phone, implode("\n", $lines), 'text', $node->id);
+            $this->sendOutbound($instance, $conversation, $phone, implode("\n", $out), 'text', $node->id);
         }
     }
 
@@ -567,8 +575,8 @@ class ConversationOrchestrator
     ): void {
         $courseId = $config['course_id'] ?? null;
         $course = $courseId
-            ? Course::query()->where('tenant_id', $instance->tenant_id)->find($courseId)
-            : Course::query()->where('tenant_id', $instance->tenant_id)->where('is_active', true)->first();
+            ? Course::query()->where('tenant_id', $instance->tenant_id)->with('paymentQr')->find($courseId)
+            : Course::query()->where('tenant_id', $instance->tenant_id)->where('is_active', true)->with('paymentQr')->first();
 
         if (! $course) {
             $this->sendOutbound(
@@ -603,23 +611,54 @@ class ConversationOrchestrator
             'amount' => $course->price,
             'currency' => $course->currency,
             'qr_payload' => 'MANUAL-QR-'.$sale->uuid,
+            'qr_media_asset_id' => $course->payment_qr_media_asset_id,
             'expires_at' => now()->addMinutes((int) ($config['ttl_minutes'] ?? 60)),
         ]);
 
-        $caption = (string) ($config['caption'] ?? 'Escanea o paga para continuar.');
+        $caption = (string) ($config['caption'] ?? 'Escanea el QR para pagar.');
         $text = "💳 *Pago pendiente*\n{$caption}\n\n"
-            ."Curso: {$course->title}\n"
-            ."Monto: {$course->price} {$course->currency}\n"
-            ."Ref: {$payment->idempotency_key}\n\n"
-            .'Cuando pagues, escribe "ya pagué" o espera la confirmación.';
+            ."*Curso:* {$course->title}\n"
+            ."*Monto:* {$course->price} {$course->currency}\n"
+            ."*Ref:* {$payment->idempotency_key}\n\n"
+            .'Cuando pagues, envíame la *foto del comprobante* por aquí.';
 
-        $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
+        $qrAsset = $course->paymentQr;
+        $mediaService = app(WhatsAppMediaService::class);
+        $dataUri = $qrAsset ? $mediaService->toDataUri($qrAsset) : null;
+
+        if ($dataUri) {
+            try {
+                $response = $this->evolution->sendMedia(
+                    $instance->evolution_instance,
+                    $phone,
+                    $dataUri,
+                    'image',
+                    $text,
+                    'qr-pago.'.(str_contains($qrAsset->mime, 'png') ? 'png' : 'jpg'),
+                    $qrAsset->mime
+                );
+                $this->storeOutbound($instance, $conversation, $node->id, 'image', $text, $response);
+            } catch (Throwable $e) {
+                Log::warning('No se pudo enviar imagen QR, fallback texto', ['error' => $e->getMessage()]);
+                $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
+            }
+        } else {
+            $this->sendOutbound(
+                $instance,
+                $conversation,
+                $phone,
+                $text."\n\n_(Sube tu QR en Cursos para enviarlo como imagen.)_",
+                'text',
+                $node->id
+            );
+        }
 
         $conversation->forceFill([
             'status' => 'waiting_payment',
             'context' => array_merge($conversation->context ?? [], [
                 'sale_id' => $sale->id,
                 'payment_id' => $payment->id,
+                'course_id' => $course->id,
             ]),
         ])->save();
     }
@@ -773,13 +812,21 @@ class ConversationOrchestrator
     {
         $buttons = $node->config['buttons'] ?? [];
         $needle = mb_strtolower(trim($text));
+        $needleNorm = preg_replace('/\s+/', ' ', $needle) ?? $needle;
+
         foreach ($buttons as $button) {
-            $label = mb_strtolower((string) ($button['label'] ?? ''));
+            $label = mb_strtolower(trim((string) ($button['label'] ?? '')));
             $id = (string) ($button['id'] ?? '');
-            if ($label !== '' && (str_contains($needle, $label) || $needle === $label)) {
+            $labelNorm = preg_replace('/\s+/', ' ', $label) ?? $label;
+
+            if ($labelNorm !== '' && ($needleNorm === $labelNorm || str_contains($needleNorm, $labelNorm) || str_contains($labelNorm, $needleNorm))) {
                 return $id !== '' ? $id : null;
             }
-            if ($id !== '' && $needle === mb_strtolower($id)) {
+            if ($id !== '' && $needleNorm === mb_strtolower($id)) {
+                return $id;
+            }
+            // Match por palabras clave del id (qr, tigo, deposito)
+            if ($id !== '' && str_contains($needleNorm, mb_strtolower($id))) {
                 return $id;
             }
         }

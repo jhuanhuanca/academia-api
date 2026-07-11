@@ -20,6 +20,7 @@ class Course extends Model
         'currency',
         'delivery_type',
         'delivery_payload',
+        'payment_qr_media_asset_id',
         'is_active',
         'sort_order',
     ];
@@ -33,5 +34,10 @@ class Course extends Model
     public function tenant(): BelongsTo
     {
         return $this->belongsTo(Tenant::class);
+    }
+
+    public function paymentQr(): BelongsTo
+    {
+        return $this->belongsTo(MediaAsset::class, 'payment_qr_media_asset_id');
     }
 }

@@ -86,7 +86,7 @@ class EvolutionClient
     }
 
     /**
-     * @param  list<array{id:string,label:string}>  $buttons
+     * @param  list<array{id?:string,label?:string,displayText?:string}>  $buttons
      * @return array<string, mixed>
      */
     public function sendButtons(
@@ -98,17 +98,22 @@ class EvolutionClient
         ?string $footer = null
     ): array {
         $mapped = [];
-        foreach ($buttons as $button) {
+        foreach (array_slice($buttons, 0, 3) as $button) {
+            $id = (string) ($button['id'] ?? uniqid('btn_', true));
+            $label = (string) ($button['label'] ?? $button['displayText'] ?? 'Opción');
+            if (mb_strlen($label) > 20) {
+                $label = mb_substr($label, 0, 20);
+            }
             $mapped[] = [
                 'type' => 'reply',
-                'displayText' => $button['label'] ?? $button['displayText'] ?? 'Opción',
-                'id' => $button['id'] ?? uniqid('btn_', true),
+                'displayText' => $label,
+                'id' => $id,
             ];
         }
 
         return $this->request('post', '/message/sendButtons/'.$instance, [
             'number' => $this->normalizeNumber($number),
-            'title' => $title,
+            'title' => mb_substr($title !== '' ? $title : 'Opciones', 0, 60),
             'description' => $description,
             'footer' => $footer ?? config('app.name', 'MarketLuna'),
             'buttons' => $mapped,
@@ -124,11 +129,13 @@ class EvolutionClient
         string $mediaUrl,
         string $mediatype = 'image',
         ?string $caption = null,
-        ?string $fileName = null
+        ?string $fileName = null,
+        ?string $mimetype = null
     ): array {
         return $this->request('post', '/message/sendMedia/'.$instance, array_filter([
             'number' => $this->normalizeNumber($number),
             'mediatype' => $mediatype,
+            'mimetype' => $mimetype,
             'media' => $mediaUrl,
             'caption' => $caption,
             'fileName' => $fileName,

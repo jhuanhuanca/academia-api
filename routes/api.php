@@ -37,6 +37,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/dashboard', DashboardController::class);
 
     Route::apiResource('courses', CourseController::class);
+    Route::post('/courses/{course}/payment-qr', [CourseController::class, 'uploadPaymentQr']);
+    Route::post('/media-assets', [MediaAssetController::class, 'store']);
     Route::apiResource('knowledge-items', KnowledgeItemController::class)->parameters([
         'knowledge-items' => 'knowledgeItem',
     ]);

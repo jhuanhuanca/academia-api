@@ -35,9 +35,18 @@ class WhatsAppMediaService
         }
 
         try {
+            $payload = $this->buildMediaPayload($raw);
+            if (empty(data_get($payload, 'message.key.id'))) {
+                Log::warning('Media sin key.id; no se puede descargar comprobante', [
+                    'keys' => array_keys($raw),
+                ]);
+
+                return null;
+            }
+
             $response = $this->evolution->getBase64FromMediaMessage(
                 $instance->evolution_instance,
-                $this->buildMediaPayload($raw)
+                $payload
             );
 
             $base64 = data_get($response, 'base64')
@@ -45,12 +54,17 @@ class WhatsAppMediaService
                 ?? data_get($response, 'media.base64');
 
             if (! is_string($base64) || $base64 === '') {
+                Log::warning('Evolution no devolvió base64 del comprobante', [
+                    'response_keys' => is_array($response) ? array_keys($response) : [],
+                ]);
+
                 return null;
             }
 
             $mime = (string) (
                 data_get($response, 'mimetype')
                 ?? data_get($response, 'data.mimetype')
+                ?? data_get($raw, 'message.imageMessage.mimetype')
                 ?? 'image/jpeg'
             );
 
@@ -66,21 +80,37 @@ class WhatsAppMediaService
     }
 
     /**
+     * Evolution v2 espera: { message: { key: { id, remoteJid, fromMe } }, convertToMp4: false }
+     *
      * @param  array<string, mixed>  $raw
      * @return array<string, mixed>
      */
     private function buildMediaPayload(array $raw): array
     {
-        $message = data_get($raw, 'message') ?? data_get($raw, 'data.message') ?? $raw;
-        $key = data_get($raw, 'key') ?? data_get($raw, 'data.key') ?? data_get($message, 'key');
+        $key = data_get($raw, 'key')
+            ?? data_get($raw, 'data.key')
+            ?? data_get($raw, 'message.key')
+            ?? [];
 
-        return array_filter([
-            'message' => is_array($message) ? $message : ['key' => $key],
+        if (! is_array($key)) {
+            $key = [];
+        }
+
+        $id = $key['id'] ?? data_get($raw, 'id') ?? data_get($raw, 'messageId');
+
+        return [
+            'message' => [
+                'key' => array_filter([
+                    'remoteJid' => $key['remoteJid'] ?? data_get($raw, 'remoteJid'),
+                    'fromMe' => (bool) ($key['fromMe'] ?? false),
+                    'id' => is_string($id) ? $id : null,
+                ], fn ($v) => $v !== null && $v !== ''),
+            ],
             'convertToMp4' => false,
-        ]);
+        ];
     }
 
-    private function storeFromBase64(
+    public function storeFromBase64(
         int $tenantId,
         string $base64,
         string $prefix,
@@ -124,5 +154,19 @@ class WhatsAppMediaService
             'size_bytes' => strlen($binary),
             'checksum' => hash('sha256', $binary),
         ]);
+    }
+
+    public function toDataUri(MediaAsset $asset): ?string
+    {
+        if (! Storage::disk($asset->disk)->exists($asset->path)) {
+            return null;
+        }
+
+        $binary = Storage::disk($asset->disk)->get($asset->path);
+        if ($binary === null || $binary === '') {
+            return null;
+        }
+
+        return 'data:'.$asset->mime.';base64,'.base64_encode($binary);
     }
 }
