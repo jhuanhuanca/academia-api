@@ -31,9 +31,14 @@ class AuthController extends Controller
             'business_name' => $data['business_name'] ?? $data['name'],
         ]);
 
+        $mailSent = (bool) ($result['mail_sent'] ?? false);
+
         return response()->json([
             'pending_approval' => true,
-            'message' => 'Registro recibido. Un administrador debe aprobar tu cuenta antes de que puedas entrar. Te avisaremos cuando esté lista.',
+            'mail_sent' => $mailSent,
+            'message' => $mailSent
+                ? 'Registro recibido. Un administrador debe aprobar tu cuenta antes de que puedas entrar.'
+                : 'Registro recibido, pero no se pudo notificar al administrador por email. Contacta a soporte.',
             'user' => [
                 'name' => $result['user']->name,
                 'email' => $result['user']->email,
