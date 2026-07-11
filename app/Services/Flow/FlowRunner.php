@@ -29,9 +29,17 @@ class FlowRunner
 
         $fromNode = $current ?? FlowNode::query()->where('flow_id', $flow->id)->find($fromId);
 
-        // Si estamos en start, saltamos al default siguiente automáticamente.
-        if ($fromNode && $fromNode->type === 'start' && $triggerType === 'default') {
+        // Nodos automáticos (start/message/send_payment_qr): seguir default,
+        // o la única salida si el usuario configuró mal el trigger (ej. ai_transition).
+        if (
+            $fromNode
+            && in_array($fromNode->type, ['start', 'message', 'send_payment_qr'], true)
+            && $triggerType === 'default'
+        ) {
             $edge = $this->findEdge($flow->id, $fromNode->id, 'default', '');
+            if (! $edge) {
+                $edge = $this->firstOutgoingEdge($flow->id, $fromNode->id);
+            }
             if ($edge) {
                 $next = FlowNode::query()->find($edge->to_node_id);
 
@@ -46,6 +54,17 @@ class FlowRunner
         $edge = $this->findEdge($flow->id, $fromId, $triggerType, $triggerKey ?? '');
         if (! $edge && $triggerKey) {
             $edge = $this->findEdge($flow->id, $fromId, $triggerType, '');
+        }
+
+        // Botón: si no hay edge exacto, intentar por trigger_key en cualquier button edge
+        if (! $edge && $triggerType === 'button' && $triggerKey) {
+            $edge = FlowEdge::query()
+                ->where('flow_id', $flow->id)
+                ->where('from_node_id', $fromId)
+                ->where('trigger_type', 'button')
+                ->where('trigger_key', $triggerKey)
+                ->orderBy('priority')
+                ->first();
         }
 
         if (! $edge) {
@@ -184,6 +203,16 @@ class FlowRunner
             ->where('trigger_type', $triggerType)
             ->where('trigger_key', $triggerKey)
             ->orderByDesc('priority')
+            ->first();
+    }
+
+    private function firstOutgoingEdge(int $flowId, int $fromNodeId): ?FlowEdge
+    {
+        return FlowEdge::query()
+            ->where('flow_id', $flowId)
+            ->where('from_node_id', $fromNodeId)
+            ->orderByDesc('priority')
+            ->orderBy('id')
             ->first();
     }
 

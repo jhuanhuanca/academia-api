@@ -463,10 +463,14 @@ class ConversationOrchestrator
             );
             $this->storeOutbound($instance, $conversation, $node->id, 'buttons', $text, $response);
         } catch (Throwable $e) {
-            Log::warning('sendButtons failed, fallback text', ['error' => $e->getMessage()]);
-            $out = [$text, ''];
+            // Baileys a menudo no soporta botones nativos → menú numerado (sí funciona)
+            Log::warning('sendButtons failed, fallback menú numerado', ['error' => $e->getMessage()]);
+            $out = [rtrim($text), '', 'Responde con el número o el nombre:'];
+            $i = 1;
             foreach ($buttons as $b) {
-                $out[] = '• '.($b['label'] ?? $b['id'] ?? 'opción');
+                $label = (string) ($b['label'] ?? $b['id'] ?? 'opción');
+                $out[] = "{$i}) {$label}";
+                $i++;
             }
             $this->sendOutbound($instance, $conversation, $phone, implode("\n", $out), 'text', $node->id);
         }
@@ -814,6 +818,14 @@ class ConversationOrchestrator
         $needle = mb_strtolower(trim($text));
         $needleNorm = preg_replace('/\s+/', ' ', $needle) ?? $needle;
 
+        // "1" / "1)" / "opcion 1" → primer botón
+        if (preg_match('/^(\d+)\s*\)?$/', $needleNorm, $m)) {
+            $idx = ((int) $m[1]) - 1;
+            if (isset($buttons[$idx]['id']) && $buttons[$idx]['id'] !== '') {
+                return (string) $buttons[$idx]['id'];
+            }
+        }
+
         foreach ($buttons as $button) {
             $label = mb_strtolower(trim((string) ($button['label'] ?? '')));
             $id = (string) ($button['id'] ?? '');
@@ -825,7 +837,6 @@ class ConversationOrchestrator
             if ($id !== '' && $needleNorm === mb_strtolower($id)) {
                 return $id;
             }
-            // Match por palabras clave del id (qr, tigo, deposito)
             if ($id !== '' && str_contains($needleNorm, mb_strtolower($id))) {
                 return $id;
             }
