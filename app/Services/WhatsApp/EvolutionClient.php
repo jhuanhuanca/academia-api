@@ -143,6 +143,44 @@ class EvolutionClient
     }
 
     /**
+     * Envío fiable: multipart file (Evolution lo convierte a buffer internamente).
+     *
+     * @return array<string, mixed>
+     */
+    public function sendMediaFile(
+        string $instance,
+        string $number,
+        string $binary,
+        string $fileName,
+        string $mimetype = 'image/jpeg',
+        string $mediatype = 'image',
+        ?string $caption = null
+    ): array {
+        $url = rtrim($this->baseUrl(), '/').'/message/sendMedia/'.$instance;
+
+        $response = Http::timeout($this->timeout())
+            ->withHeaders(['apikey' => $this->apiKey()])
+            ->attach('file', $binary, $fileName, ['Content-Type' => $mimetype])
+            ->post($url, array_filter([
+                'number' => $this->normalizeNumber($number),
+                'mediatype' => $mediatype,
+                'mimetype' => $mimetype,
+                'fileName' => $fileName,
+                'caption' => $caption,
+            ], fn ($v) => $v !== null && $v !== ''));
+
+        if ($response->failed()) {
+            throw new RuntimeException(
+                'Evolution sendMediaFile '.$response->status().': '.$response->body()
+            );
+        }
+
+        $json = $response->json();
+
+        return is_array($json) ? $json : ['raw' => $response->body()];
+    }
+
+    /**
      * @param  array<string, mixed>  $payload
      * @return array<string, mixed>
      */

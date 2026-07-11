@@ -638,6 +638,9 @@ class ConversationOrchestrator
             ."*Ref:* {$payment->idempotency_key}\n\n"
             .'Cuando pagues, envíame la *foto del comprobante* por aquí.';
 
+        // Texto primero (siempre llega), imagen después
+        $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
+
         if ($qrAsset) {
             try {
                 $response = app(WhatsAppMediaService::class)->sendImage(
@@ -645,16 +648,21 @@ class ConversationOrchestrator
                     $instance->evolution_instance,
                     $phone,
                     $qrAsset,
-                    $text
+                    '📲 Escanea este QR para pagar'
                 );
-                $this->storeOutbound($instance, $conversation, $node->id, 'image', $text, $response);
+                $this->storeOutbound($instance, $conversation, $node->id, 'image', '[qr-pago]', $response);
             } catch (Throwable $e) {
-                Log::error('Fallo envío QR imagen', ['error' => $e->getMessage(), 'asset_id' => $qrAsset->id]);
+                Log::error('Fallo envío QR imagen', [
+                    'error' => $e->getMessage(),
+                    'asset_id' => $qrAsset->id,
+                    'path' => $qrAsset->path,
+                    'disk' => $qrAsset->disk,
+                ]);
                 $this->sendOutbound(
                     $instance,
                     $conversation,
                     $phone,
-                    $text."\n\n_(No pude adjuntar la imagen del QR. Revisa logs / APP_URL.)_",
+                    '⚠️ No pude enviar la imagen del QR. Un asesor te la reenvía en breve, o pide *humano*.',
                     'text',
                     $node->id
                 );
@@ -668,7 +676,7 @@ class ConversationOrchestrator
                 $instance,
                 $conversation,
                 $phone,
-                $text."\n\n_(Falta subir el QR: Dashboard → Cursos → Subir QR de cobro.)_",
+                '⚠️ Falta configurar la imagen QR: Dashboard → Cursos → Subir QR de cobro.',
                 'text',
                 $node->id
             );

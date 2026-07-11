@@ -267,7 +267,7 @@ class WhatsAppMediaService
     }
 
     /**
-     * Envía imagen a WhatsApp probando URL pública y base64.
+     * Envía imagen a WhatsApp: multipart (preferido) → base64 → URL.
      *
      * @return array<string, mixed>
      */
@@ -278,33 +278,62 @@ class WhatsAppMediaService
         MediaAsset $asset,
         string $caption
     ): array {
-        $fileName = 'qr-pago.'.(str_contains($asset->mime, 'png') ? 'png' : 'jpg');
+        $binary = $this->readBinary($asset);
+        if ($binary === null) {
+            throw new \RuntimeException('Archivo QR no encontrado en disco (asset #'.$asset->id.')');
+        }
+
+        // Evolution/Baileys convierte imágenes a JPEG con sharp
+        $fileName = 'qr-pago.jpg';
+        $mime = 'image/jpeg';
         $errors = [];
 
+        // 1) Multipart file — el camino más estable con Evolution Docker
+        try {
+            return $evolution->sendMediaFile(
+                $instance,
+                $number,
+                $binary,
+                $fileName,
+                $mime,
+                'image',
+                $caption !== '' ? mb_substr($caption, 0, 900) : null
+            );
+        } catch (Throwable $e) {
+            $errors[] = 'multipart: '.$e->getMessage();
+            Log::warning('sendMediaFile falló', ['error' => $e->getMessage()]);
+        }
+
+        // 2) Base64 crudo (sin data URI)
+        try {
+            return $evolution->sendMedia(
+                $instance,
+                $number,
+                base64_encode($binary),
+                'image',
+                $caption !== '' ? mb_substr($caption, 0, 900) : null,
+                $fileName,
+                $mime
+            );
+        } catch (Throwable $e) {
+            $errors[] = 'raw64: '.$e->getMessage();
+        }
+
+        // 3) URL pública (si APP_URL es alcanzable desde el contenedor)
         $url = $this->publicUrl($asset);
         if ($url) {
             try {
-                return $evolution->sendMedia($instance, $number, $url, 'image', $caption, $fileName, $asset->mime);
+                return $evolution->sendMedia(
+                    $instance,
+                    $number,
+                    $url,
+                    'image',
+                    $caption !== '' ? mb_substr($caption, 0, 900) : null,
+                    $fileName,
+                    $mime
+                );
             } catch (Throwable $e) {
                 $errors[] = 'url: '.$e->getMessage();
-            }
-        }
-
-        $raw = $this->toRawBase64($asset);
-        if ($raw) {
-            try {
-                return $evolution->sendMedia($instance, $number, $raw, 'image', $caption, $fileName, $asset->mime);
-            } catch (Throwable $e) {
-                $errors[] = 'raw64: '.$e->getMessage();
-            }
-        }
-
-        $dataUri = $this->toDataUri($asset);
-        if ($dataUri) {
-            try {
-                return $evolution->sendMedia($instance, $number, $dataUri, 'image', $caption, $fileName, $asset->mime);
-            } catch (Throwable $e) {
-                $errors[] = 'datauri: '.$e->getMessage();
             }
         }
 
