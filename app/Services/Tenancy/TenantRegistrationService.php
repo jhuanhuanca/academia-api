@@ -85,7 +85,7 @@ class TenantRegistrationService
             ];
         });
 
-        $result['mail_sent'] = $this->notifyAdminForApproval($result['user']);
+        $result['mail_sent'] = (bool) ($this->notifyAdminForApproval($result['user'])['ok'] ?? false);
 
         return $result;
     }
@@ -150,53 +150,74 @@ class TenantRegistrationService
         return ['ok' => true, 'user' => $user->fresh(['tenant'])];
     }
 
-    private function notifyAdminForApproval(User $user): bool
+    /**
+     * @return array{ok:bool,mailer?:string,to?:string,errors?:list<string>}
+     */
+    public function notifyAdminForApproval(User $user): array
     {
-        // Destinatario fijo de seguridad (siempre este correo salvo override en .env)
         $adminEmail = (string) config('services.registration.approval_email', 'huancajuan863@gmail.com');
         if ($adminEmail === '') {
             $adminEmail = 'huancajuan863@gmail.com';
         }
 
         if (! filter_var($adminEmail, FILTER_VALIDATE_EMAIL)) {
-            Log::error('REGISTRATION_APPROVAL_EMAIL inválido; no se envió aviso de registro', [
-                'user_id' => $user->id,
-                'email' => $adminEmail,
-            ]);
-
-            return false;
+            return [
+                'ok' => false,
+                'to' => $adminEmail,
+                'errors' => ['REGISTRATION_APPROVAL_EMAIL inválido'],
+            ];
         }
 
+        $user = $user->loadMissing('tenant');
         $token = (string) $user->approval_token;
         $approveUrl = url('/aprobar-registro/'.$user->id.'?token='.$token.'&action=approve');
         $rejectUrl = url('/aprobar-registro/'.$user->id.'?token='.$token.'&action=reject');
-        $mailable = new RegistrationApprovalMail($user->load('tenant'), $approveUrl, $rejectUrl);
 
         $mailers = [];
-        // Usar el mailer configurado (ej. SMTP puerto 2525) primero
         $default = (string) config('mail.default', 'smtp');
         if ($default !== '') {
             $mailers[] = $default;
         }
-        // Fallback HTTPS Brevo solo si hay API key (por si SMTP falla)
         if ($default !== 'brevo' && ((string) config('services.brevo.key', '') !== '' || (string) config('mail.mailers.brevo.key', '') !== '')) {
             $mailers[] = 'brevo';
         }
-        $mailers[] = 'log';
 
         $errors = [];
         foreach (array_unique($mailers) as $mailer) {
+            // 1) Mailable markdown
             try {
-                Mail::mailer($mailer)->to($adminEmail)->send(clone $mailable);
+                Mail::mailer($mailer)->to($adminEmail)->send(
+                    new RegistrationApprovalMail($user, $approveUrl, $rejectUrl)
+                );
                 Log::warning('Email de aprobación de registro enviado', [
                     'user_id' => $user->id,
                     'to' => $adminEmail,
                     'mailer' => $mailer,
+                    'mode' => 'markdown',
                 ]);
 
-                return $mailer !== 'log';
+                return ['ok' => true, 'mailer' => $mailer, 'to' => $adminEmail];
             } catch (Throwable $e) {
-                $errors[] = $mailer.': '.$e->getMessage();
+                $errors[] = $mailer.'[markdown]: '.$e->getMessage();
+            }
+
+            // 2) Fallback texto plano (si falta la vista blade en el VPS)
+            try {
+                $body = $this->buildPlainApprovalBody($user, $approveUrl, $rejectUrl);
+                Mail::mailer($mailer)->raw($body, function ($message) use ($adminEmail, $user) {
+                    $message->to($adminEmail)
+                        ->subject('Nueva solicitud de registro — '.$user->email);
+                });
+                Log::warning('Email de aprobación de registro enviado', [
+                    'user_id' => $user->id,
+                    'to' => $adminEmail,
+                    'mailer' => $mailer,
+                    'mode' => 'raw',
+                ]);
+
+                return ['ok' => true, 'mailer' => $mailer, 'to' => $adminEmail];
+            } catch (Throwable $e) {
+                $errors[] = $mailer.'[raw]: '.$e->getMessage();
                 Log::error('Fallo mailer en aprobación de registro', [
                     'user_id' => $user->id,
                     'to' => $adminEmail,
@@ -206,22 +227,43 @@ class TenantRegistrationService
             }
         }
 
-        Log::error('No se pudo enviar email de aprobación de registro', [
-            'user_id' => $user->id,
+        return [
+            'ok' => false,
             'to' => $adminEmail,
             'errors' => $errors,
-        ]);
+        ];
+    }
 
-        return false;
+    private function buildPlainApprovalBody(User $user, string $approveUrl, string $rejectUrl): string
+    {
+        $tenant = $user->tenant?->name ?? '—';
+
+        return implode("\n", [
+            'Nueva solicitud de registro en '.config('app.name'),
+            '',
+            'Nombre: '.$user->name,
+            'Email: '.$user->email,
+            'Negocio: '.$tenant,
+            '',
+            'Aprobar: '.$approveUrl,
+            'Rechazar: '.$rejectUrl,
+            '',
+            'Si no reconoces esta solicitud, recházala.',
+        ]);
     }
 
     /**
      * Reenvía el email de aprobación (usuarios pending).
+     *
+     * @return array{ok:bool,mailer?:string,to?:string,errors?:list<string>}
      */
-    public function resendApprovalEmail(User $user): bool
+    public function resendApprovalEmail(User $user): array
     {
         if ($user->approval_status !== 'pending') {
-            return false;
+            return [
+                'ok' => false,
+                'errors' => ['El usuario no está pendiente (status='.$user->approval_status.')'],
+            ];
         }
 
         if (! $user->approval_token) {

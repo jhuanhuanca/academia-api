@@ -10,7 +10,7 @@ class ResendRegistrationApprovalCommand extends Command
 {
     protected $signature = 'registration:resend-approval {user? : ID o email del usuario pendiente}';
 
-    protected $description = 'Reenvía el email de aprobación de registro al admin (huancajuan863@gmail.com)';
+    protected $description = 'Reenvía el email de aprobación de registro al admin';
 
     public function handle(TenantRegistrationService $registration): int
     {
@@ -35,17 +35,30 @@ class ResendRegistrationApprovalCommand extends Command
             return self::FAILURE;
         }
 
-        $this->info("Reenviando aprobación de #{$user->id} {$user->email} → ".config('services.registration.approval_email'));
+        $this->table(['Clave', 'Valor'], [
+            ['Usuario', "#{$user->id} {$user->email}"],
+            ['Admin destino', (string) config('services.registration.approval_email')],
+            ['MAIL_MAILER', (string) config('mail.default')],
+            ['MAIL_HOST', (string) config('mail.mailers.smtp.host')],
+            ['MAIL_PORT', (string) config('mail.mailers.smtp.port')],
+            ['MAIL_FROM', (string) config('mail.from.address')],
+            ['BREVO_API_KEY', config('services.brevo.key') ? 'sí (oculta)' : 'no'],
+        ]);
 
-        $ok = $registration->resendApprovalEmail($user);
+        $result = $registration->resendApprovalEmail($user);
 
-        if (! $ok) {
-            $this->error('No se pudo enviar. Revisa MAIL_MAILER=brevo, BREVO_API_KEY y storage/logs/laravel.log');
+        if (! ($result['ok'] ?? false)) {
+            $this->error('No se pudo enviar el email.');
+            foreach ($result['errors'] ?? ['Error desconocido'] as $err) {
+                $this->line(' - '.$err);
+            }
+            $this->newLine();
+            $this->line('Revisa también: grep -i "aprobación\|Fallo mailer" storage/logs/laravel.log | tail -n 30');
 
             return self::FAILURE;
         }
 
-        $this->info('Email enviado correctamente.');
+        $this->info('Email enviado con mailer: '.($result['mailer'] ?? '?').' → '.($result['to'] ?? ''));
 
         return self::SUCCESS;
     }
