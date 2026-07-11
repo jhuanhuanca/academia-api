@@ -108,9 +108,9 @@ class EvolutionWebhookController extends Controller
                 return $payload;
             }
 
-            $dir = storage_path('app/webhook-media');
+            $dir = storage_path('app/public/webhook-media');
             if (! is_dir($dir)) {
-                mkdir($dir, 0755, true);
+                mkdir($dir, 0775, true);
             }
             $file = $dir.'/'.uniqid('wa_', true).'.bin';
             file_put_contents($file, $binary);

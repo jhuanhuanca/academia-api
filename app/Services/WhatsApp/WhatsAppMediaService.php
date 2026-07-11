@@ -256,19 +256,29 @@ class WhatsAppMediaService
 
         // 1) Objeto completo (recomendado por Evolution si no está en DB aún)
         if (is_array($messageBody)) {
+            $cleanBody = $messageBody;
+            // Evolution falla si "base64" viene dentro de message (ephemeralMessage TypeError)
+            unset($cleanBody['base64']);
+
             $variants[] = [
                 'message' => [
                     'key' => $keyFull,
-                    'message' => $messageBody,
+                    'message' => $cleanBody,
                 ],
                 'convertToMp4' => false,
             ];
         }
 
-        // 2) Ítem webhook completo como "message"
-        if (isset($raw['key'])) {
+        // 2) Ítem webhook limpio
+        if (isset($raw['key']) && is_array($messageBody)) {
+            $cleanRaw = $raw;
+            if (isset($cleanRaw['message']) && is_array($cleanRaw['message'])) {
+                unset($cleanRaw['message']['base64']);
+            }
+            unset($cleanRaw['base64'], $cleanRaw['_media_file'], $cleanRaw['_media_mime']);
+
             $variants[] = [
-                'message' => $raw,
+                'message' => $cleanRaw,
                 'convertToMp4' => false,
             ];
         }
@@ -312,43 +322,48 @@ class WhatsAppMediaService
             default => 'jpg',
         };
 
-        // QR de cobro → disco public (payment-qr/...). Resto → local.
-        $isPaymentQr = str_starts_with($prefix, 'payment-qr') || $prefix === 'payment-qr';
-
-        if ($isPaymentQr) {
-            // Creamos el registro primero para usar el id en el path
-            $asset = MediaAsset::create([
-                'tenant_id' => $tenantId,
-                'disk' => 'public',
-                'path' => 'pending',
-                'mime' => $mime,
-                'size_bytes' => strlen($binary),
-                'checksum' => hash('sha256', $binary),
-            ]);
-
-            $path = sprintf('payment-qr/%d/%d.%s', $tenantId, $asset->id, $ext);
-            Storage::disk('public')->put($path, $binary);
-            $asset->update(['path' => $path]);
-
-            return $asset->fresh();
-        }
-
-        $path = sprintf('media/%d/%s_%s.%s', $tenantId, $prefix, Str::uuid(), $ext);
-        Storage::disk('local')->put($path, $binary);
+        // Todo el media de WhatsApp vive en disco public (permisos OK en VPS).
+        // payment-qr/{tenant}/{id}.ext | receipts/{tenant}/{id}.ext | uploads/...
+        $folder = match (true) {
+            str_starts_with($prefix, 'payment-qr') => 'payment-qr',
+            str_starts_with($prefix, 'receipt') => 'receipts',
+            default => 'uploads',
+        };
 
         $asset = MediaAsset::create([
             'tenant_id' => $tenantId,
-            'disk' => 'local',
-            'path' => $path,
+            'disk' => 'public',
+            'path' => 'pending',
             'mime' => $mime,
             'size_bytes' => strlen($binary),
             'checksum' => hash('sha256', $binary),
         ]);
 
-        // Espejo público por si se necesita URL
-        $this->ensurePublicCopy($asset, $binary);
+        $path = sprintf('%s/%d/%d.%s', $folder, $tenantId, $asset->id, $ext);
+        $this->putPublicBinary($path, $binary);
+        $asset->update(['path' => $path]);
 
-        return $asset;
+        return $asset->fresh();
+    }
+
+    /**
+     * Escribe en storage/app/public creando carpetas si hacen falta.
+     */
+    private function putPublicBinary(string $path, string $binary): void
+    {
+        $fullDir = storage_path('app/public/'.dirname($path));
+        if (! is_dir($fullDir) && ! mkdir($fullDir, 0775, true) && ! is_dir($fullDir)) {
+            throw new \RuntimeException('No se pudo crear carpeta pública: '.$fullDir);
+        }
+
+        $ok = Storage::disk('public')->put($path, $binary);
+        if ($ok === false || ! Storage::disk('public')->exists($path)) {
+            // Fallback directo por si el adapter falla con permisos
+            $fullPath = storage_path('app/public/'.$path);
+            if (file_put_contents($fullPath, $binary) === false) {
+                throw new \RuntimeException('No se pudo guardar archivo en: '.$fullPath);
+            }
+        }
     }
 
     public function toDataUri(MediaAsset $asset): ?string
@@ -498,7 +513,7 @@ class WhatsAppMediaService
         $publicPath = sprintf('payment-qr/%d/%d.%s', $asset->tenant_id, $asset->id, $ext);
 
         try {
-            Storage::disk('public')->put($publicPath, $binary);
+            $this->putPublicBinary($publicPath, $binary);
 
             return $publicPath;
         } catch (Throwable $e) {
