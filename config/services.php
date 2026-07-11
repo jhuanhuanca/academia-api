@@ -52,6 +52,11 @@ return [
         'notify_emails' => env('PAYMENT_NOTIFY_EMAILS', ''),
     ],
 
+    'registration' => [
+        // Email obligatorio que recibe solicitudes de alta para aprobar/rechazar
+        'approval_email' => env('REGISTRATION_APPROVAL_EMAIL', 'huancajuan863@gmail.com'),
+    ],
+
     'brevo' => [
         // API key (xkeysib-...), NO la SMTP key. Se crea en Brevo → SMTP & API → API Keys
         'key' => env('BREVO_API_KEY'),

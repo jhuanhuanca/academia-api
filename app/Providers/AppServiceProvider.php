@@ -21,6 +21,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        \Illuminate\Http\Resources\Json\JsonResource::withoutWrapping();
+
         Mail::extend('brevo', function (array $config = []) {
             $key = (string) ($config['key'] ?? config('services.brevo.key') ?? '');
             if ($key === '') {

@@ -5,13 +5,43 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\UserResource;
 use App\Models\User;
+use App\Services\Tenancy\TenantRegistrationService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\Rules\Password;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
+    public function register(Request $request, TenantRegistrationService $registration): JsonResponse
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:120'],
+            'email' => ['required', 'email', 'max:190'],
+            'password' => ['required', 'string', 'confirmed', Password::min(8)],
+            'business_name' => ['nullable', 'string', 'max:160'],
+            'device_name' => ['nullable', 'string', 'max:80'],
+        ]);
+
+        $result = $registration->register([
+            'name' => $data['name'],
+            'email' => $data['email'],
+            'password' => $data['password'],
+            'business_name' => $data['business_name'] ?? $data['name'],
+        ]);
+
+        return response()->json([
+            'pending_approval' => true,
+            'message' => 'Registro recibido. Un administrador debe aprobar tu cuenta antes de que puedas entrar. Te avisaremos cuando esté lista.',
+            'user' => [
+                'name' => $result['user']->name,
+                'email' => $result['user']->email,
+                'business_name' => $result['tenant']->name,
+            ],
+        ], 201);
+    }
+
     public function login(Request $request): JsonResponse
     {
         $credentials = $request->validate([
@@ -23,12 +53,23 @@ class AuthController extends Controller
         /** @var User|null $user */
         $user = User::query()
             ->where('email', $credentials['email'])
-            ->where('is_active', true)
             ->first();
 
         if (! $user || ! Hash::check($credentials['password'], $user->password)) {
             throw ValidationException::withMessages([
                 'email' => ['Credenciales incorrectas.'],
+            ]);
+        }
+
+        if ($user->approval_status === 'pending' || (! $user->is_active && $user->approval_status !== 'rejected')) {
+            throw ValidationException::withMessages([
+                'email' => ['Tu cuenta está pendiente de aprobación. Espera el OK del administrador.'],
+            ]);
+        }
+
+        if ($user->approval_status === 'rejected' || ! $user->is_active) {
+            throw ValidationException::withMessages([
+                'email' => ['Tu cuenta fue rechazada o está desactivada. Contacta al administrador.'],
             ]);
         }
 

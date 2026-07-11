@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\PaymentConfirmationWebController;
+use App\Http\Controllers\RegistrationApprovalWebController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -20,3 +21,6 @@ Route::get('/', function () {
 
 Route::get('/confirmar-pago/{payment}', PaymentConfirmationWebController::class)
     ->name('payments.confirm');
+
+Route::get('/aprobar-registro/{user}', RegistrationApprovalWebController::class)
+    ->name('registration.approve');
