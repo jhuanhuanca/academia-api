@@ -32,6 +32,28 @@ class WhatsAppMediaService
             return null;
         }
 
+        // Media ya guardada en disco por el webhook (evita truncado JSON)
+        $mediaFile = data_get($raw, '_media_file');
+        if (is_string($mediaFile) && is_file($mediaFile)) {
+            try {
+                $binary = file_get_contents($mediaFile);
+                if ($binary !== false && $binary !== '') {
+                    $mime = (string) (data_get($raw, '_media_mime') ?: 'image/jpeg');
+                    $asset = $this->storeFromBase64(
+                        $instance->tenant_id,
+                        'data:'.$mime.';base64,'.base64_encode($binary),
+                        'receipt-wa',
+                        $mime
+                    );
+                    @unlink($mediaFile);
+
+                    return $asset;
+                }
+            } catch (Throwable $e) {
+                Log::warning('No se pudo leer _media_file del webhook', ['error' => $e->getMessage()]);
+            }
+        }
+
         $inline = $this->extractInlineBase64($raw);
         if ($inline) {
             try {
@@ -46,12 +68,13 @@ class WhatsAppMediaService
             }
         }
 
-        try {
-            $payloads = $this->buildMediaPayloadVariants($raw);
-            $lastError = null;
+        $lastError = null;
+        $payloads = $this->buildMediaPayloadVariants($raw);
 
+        // Evolution a veces indexa el mensaje 1-2s después del webhook
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
             foreach ($payloads as $payload) {
-                if (empty(data_get($payload, 'message.key.id'))) {
+                if (empty(data_get($payload, 'message.key.id')) && empty(data_get($payload, 'key.id'))) {
                     continue;
                 }
 
@@ -61,39 +84,72 @@ class WhatsAppMediaService
                         $payload
                     );
 
-                    $base64 = data_get($response, 'base64')
-                        ?? data_get($response, 'data.base64')
-                        ?? data_get($response, 'media.base64');
-
-                    if (! is_string($base64) || $base64 === '') {
+                    $parsed = $this->parseBase64Response($response, $raw);
+                    if ($parsed === null) {
+                        $lastError = 'respuesta sin base64 (keys: '.implode(',', array_keys($response)).')';
                         continue;
                     }
 
-                    $mime = (string) (
-                        data_get($response, 'mimetype')
-                        ?? data_get($response, 'data.mimetype')
-                        ?? data_get($raw, 'message.imageMessage.mimetype')
-                        ?? data_get($raw, 'message.documentMessage.mimetype')
-                        ?? 'image/jpeg'
+                    return $this->storeFromBase64(
+                        $instance->tenant_id,
+                        $parsed['base64'],
+                        'receipt-wa',
+                        $parsed['mime']
                     );
-
-                    return $this->storeFromBase64($instance->tenant_id, $base64, 'receipt-wa', $mime);
                 } catch (Throwable $e) {
                     $lastError = $e->getMessage();
                 }
             }
 
-            Log::warning('No se pudo descargar media de Evolution', [
-                'error' => $lastError,
-                'instance' => $instance->evolution_instance,
-                'has_key' => (bool) data_get($raw, 'key.id'),
-                'message_keys' => array_keys((array) data_get($raw, 'message', [])),
-            ]);
-        } catch (Throwable $e) {
-            Log::warning('Error general al procesar comprobante', [
-                'error' => $e->getMessage(),
-                'instance' => $instance->evolution_instance,
-            ]);
+            if ($attempt < 3) {
+                usleep(800_000);
+            }
+        }
+
+        Log::warning('No se pudo descargar media de Evolution', [
+            'error' => $lastError,
+            'instance' => $instance->evolution_instance,
+            'has_key' => (bool) data_get($raw, 'key.id'),
+            'message_keys' => array_keys((array) data_get($raw, 'message', [])),
+            'variants' => count($payloads),
+            'has_inline_hint' => (bool) data_get($raw, 'base64'),
+        ]);
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $response
+     * @param  array<string, mixed>  $raw
+     * @return array{base64:string,mime:string}|null
+     */
+    private function parseBase64Response(array $response, array $raw): ?array
+    {
+        $candidates = [
+            data_get($response, 'base64'),
+            data_get($response, 'buffer'),
+            data_get($response, 'data.base64'),
+            data_get($response, 'data.buffer'),
+            data_get($response, 'media.base64'),
+            data_get($response, 'media'),
+        ];
+
+        foreach ($candidates as $value) {
+            if (! is_string($value) || strlen($value) < 200) {
+                continue;
+            }
+
+            $mime = (string) (
+                data_get($response, 'mimetype')
+                ?? data_get($response, 'mimeType')
+                ?? data_get($response, 'data.mimetype')
+                ?? data_get($raw, 'message.imageMessage.mimetype')
+                ?? data_get($raw, 'message.documentMessage.mimetype')
+                ?? data_get($raw, 'message.stickerMessage.mimetype')
+                ?? 'image/jpeg'
+            );
+
+            return ['base64' => $value, 'mime' => $mime];
         }
 
         return null;
@@ -112,24 +168,61 @@ class WhatsAppMediaService
             data_get($raw, 'msgContent'),
             data_get($raw, 'message.imageMessage.base64'),
             data_get($raw, 'message.documentMessage.base64'),
+            data_get($raw, 'message.stickerMessage.base64'),
+            data_get($raw, 'message.imageMessage.jpegThumbnail'),
+            data_get($raw, 'message.documentMessage.jpegThumbnail'),
         ];
 
+        // Busca recursivo cualquier clave "base64" (webhookBase64 de Evolution)
+        $this->collectBase64Candidates($raw, $candidates);
+
+        $best = null;
+        $bestLen = 0;
+
         foreach ($candidates as $value) {
-            if (! is_string($value) || strlen($value) < 200) {
+            if (! is_string($value)) {
                 continue;
             }
 
-            $mime = null;
-            if (str_contains($value, 'base64,')) {
-                if (preg_match('/data:([^;]+);/', $value, $m)) {
-                    $mime = $m[1];
-                }
+            $len = strlen($value);
+            // Miniaturas jpegThumbnail suelen ser < 8KB; un comprobante real supera eso
+            if ($len < 8000) {
+                continue;
             }
 
-            return ['base64' => $value, 'mime' => $mime];
+            if ($len > $bestLen) {
+                $mime = null;
+                if (str_contains($value, 'base64,')) {
+                    if (preg_match('/data:([^;]+);/', $value, $m)) {
+                        $mime = $m[1];
+                    }
+                }
+                $best = ['base64' => $value, 'mime' => $mime];
+                $bestLen = $len;
+            }
         }
 
-        return null;
+        return $best;
+    }
+
+    /**
+     * @param  array<string, mixed>  $node
+     * @param  list<mixed>  $out
+     */
+    private function collectBase64Candidates(array $node, array &$out, int $depth = 0): void
+    {
+        if ($depth > 6) {
+            return;
+        }
+
+        foreach ($node as $key => $value) {
+            if (is_string($key) && strcasecmp($key, 'base64') === 0 && is_string($value)) {
+                $out[] = $value;
+            }
+            if (is_array($value)) {
+                $this->collectBase64Candidates($value, $out, $depth + 1);
+            }
+        }
     }
 
     /**
@@ -143,7 +236,7 @@ class WhatsAppMediaService
             $key = [];
         }
 
-        $id = $key['id'] ?? data_get($raw, 'id') ?? data_get($raw, 'messageId');
+        $id = $key['id'] ?? data_get($raw, 'id') ?? data_get($raw, 'messageId') ?? data_get($raw, 'wa_message_id');
         if (! is_string($id) || $id === '') {
             return [];
         }
@@ -159,17 +252,9 @@ class WhatsAppMediaService
             'participant' => $key['participant'] ?? null,
         ], fn ($v) => $v !== null && $v !== '');
 
-        $variants = [
-            [
-                'message' => ['key' => $keyFull],
-                'convertToMp4' => false,
-            ],
-            [
-                'message' => ['key' => ['id' => $id]],
-                'convertToMp4' => false,
-            ],
-        ];
+        $variants = [];
 
+        // 1) Objeto completo (recomendado por Evolution si no está en DB aún)
         if (is_array($messageBody)) {
             $variants[] = [
                 'message' => [
@@ -179,6 +264,24 @@ class WhatsAppMediaService
                 'convertToMp4' => false,
             ];
         }
+
+        // 2) Ítem webhook completo como "message"
+        if (isset($raw['key'])) {
+            $variants[] = [
+                'message' => $raw,
+                'convertToMp4' => false,
+            ];
+        }
+
+        // 3) Solo key (busca en DB de Evolution)
+        $variants[] = [
+            'message' => ['key' => $keyFull],
+            'convertToMp4' => false,
+        ];
+        $variants[] = [
+            'message' => ['key' => ['id' => $id]],
+            'convertToMp4' => false,
+        ];
 
         return $variants;
     }

@@ -52,7 +52,7 @@ class EvolutionWebhookController extends Controller
             'source' => 'evolution',
             'event_type' => Str::limit($eventType, 80, ''),
             'dedupe_key' => $dedupe,
-            'payload' => $payload,
+            'payload' => $this->compactMediaPayload($payload),
             'status' => 'received',
             'created_at' => now(),
         ]);
@@ -79,5 +79,52 @@ class EvolutionWebhookController extends Controller
         }
 
         return 'evo:'.sha1($eventType.'|'.json_encode($payload));
+    }
+
+    /**
+     * Evita que MySQL/JSON truncquen el webhook: mueve base64 grandes a disco
+     * y deja una referencia legible para el worker.
+     *
+     * @param  array<string, mixed>  $payload
+     * @return array<string, mixed>
+     */
+    private function compactMediaPayload(array $payload): array
+    {
+        $base64 = data_get($payload, 'data.base64')
+            ?? data_get($payload, 'data.message.base64')
+            ?? data_get($payload, 'base64');
+
+        if (! is_string($base64) || strlen($base64) < 8000) {
+            return $payload;
+        }
+
+        try {
+            $clean = $base64;
+            if (str_contains($clean, 'base64,')) {
+                $clean = explode('base64,', $clean, 2)[1];
+            }
+            $binary = base64_decode($clean, true);
+            if ($binary === false || $binary === '') {
+                return $payload;
+            }
+
+            $dir = storage_path('app/webhook-media');
+            if (! is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            $file = $dir.'/'.uniqid('wa_', true).'.bin';
+            file_put_contents($file, $binary);
+
+            data_set($payload, 'data.base64', null);
+            data_set($payload, 'data.message.base64', null);
+            data_set($payload, 'data._media_file', $file);
+            data_set($payload, 'data._media_mime', data_get($payload, 'data.message.imageMessage.mimetype')
+                ?? data_get($payload, 'data.message.documentMessage.mimetype')
+                ?? 'image/jpeg');
+        } catch (\Throwable) {
+            // Si falla el compact, dejamos el payload original
+        }
+
+        return $payload;
     }
 }

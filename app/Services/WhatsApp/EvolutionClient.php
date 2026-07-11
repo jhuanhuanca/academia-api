@@ -69,9 +69,14 @@ class EvolutionClient
      */
     public function setWebhook(string $instance, array $webhook): array
     {
-        return $this->request('post', '/webhook/set/'.$instance, [
-            'webhook' => $webhook,
-        ]);
+        try {
+            return $this->request('post', '/webhook/set/'.$instance, [
+                'webhook' => $webhook,
+            ]);
+        } catch (RuntimeException $e) {
+            // Algunas builds aceptan el body plano sin wrapper "webhook"
+            return $this->request('post', '/webhook/set/'.$instance, $webhook);
+        }
     }
 
     /**
