@@ -52,11 +52,8 @@ class FlowRunner
         }
 
         $edge = $this->findEdge($flow->id, $fromId, $triggerType, $triggerKey ?? '');
-        if (! $edge && $triggerKey) {
-            $edge = $this->findEdge($flow->id, $fromId, $triggerType, '');
-        }
 
-        // Botón: si no hay edge exacto, intentar por trigger_key en cualquier button edge
+        // Botón: si no hay edge exacto, buscar por trigger_key
         if (! $edge && $triggerType === 'button' && $triggerKey) {
             $edge = FlowEdge::query()
                 ->where('flow_id', $flow->id)
@@ -67,8 +64,18 @@ class FlowRunner
                 ->first();
         }
 
+        // También aceptar trigger_type "default" mal configurado con la misma key
+        if (! $edge && $triggerType === 'button' && $triggerKey) {
+            $edge = FlowEdge::query()
+                ->where('flow_id', $flow->id)
+                ->where('from_node_id', $fromId)
+                ->where('trigger_key', $triggerKey)
+                ->orderByDesc('priority')
+                ->first();
+        }
+
         if (! $edge) {
-            return ['node' => $fromNode, 'edge' => null, 'actions' => []];
+            return ['node' => null, 'edge' => null, 'actions' => []];
         }
 
         $next = FlowNode::query()->find($edge->to_node_id);

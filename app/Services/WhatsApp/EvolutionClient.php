@@ -236,9 +236,20 @@ class EvolutionClient
 
     private function normalizeNumber(string $number): string
     {
-        $digits = preg_replace('/\D+/', '', $number) ?? '';
+        $number = trim($number);
 
-        return $digits;
+        // WhatsApp Linked Identity: hay que enviar el JID completo (…@lid)
+        if (str_contains($number, '@lid')) {
+            return $number;
+        }
+
+        if (str_contains($number, '@')) {
+            $user = explode('@', $number)[0] ?? '';
+
+            return preg_replace('/\D+/', '', $user) ?? '';
+        }
+
+        return preg_replace('/\D+/', '', $number) ?? '';
     }
 
     private function baseUrl(): string

@@ -107,11 +107,15 @@ class IncomingMessageNormalizer
      */
     private function mapMessage(array $item): array
     {
-        $key = $item['key'] ?? [];
+        $key = is_array($item['key'] ?? null) ? $item['key'] : [];
         $remoteJid = (string) ($key['remoteJid'] ?? $item['remoteJid'] ?? '');
+        $remoteJidAlt = (string) ($key['remoteJidAlt'] ?? $item['remoteJidAlt'] ?? '');
+        $senderPn = (string) ($key['senderPn'] ?? $item['senderPn'] ?? '');
         $fromMe = (bool) ($key['fromMe'] ?? false);
         $messageId = $key['id'] ?? $item['id'] ?? null;
         $pushName = $item['pushName'] ?? data_get($item, 'message.pushName');
+
+        $resolved = $this->resolveAddress($remoteJid, $remoteJidAlt, $senderPn, $item);
 
         $message = $item['message'] ?? [];
 
@@ -198,7 +202,9 @@ class IncomingMessageNormalizer
 
         return [
             'wa_message_id' => is_string($messageId) ? $messageId : null,
-            'phone_e164' => $this->jidToPhone($remoteJid),
+            'phone_e164' => $resolved['phone_e164'],
+            // Destino para Evolution: teléfono real o JID @lid completo
+            'reply_to' => $resolved['reply_to'],
             'wa_name' => is_string($pushName) ? $pushName : null,
             'from_me' => $fromMe,
             'type' => $type,
@@ -209,6 +215,77 @@ class IncomingMessageNormalizer
         ];
     }
 
+    /**
+     * WhatsApp ahora envía a menudo remoteJid=@lid (ID interno).
+     * El teléfono real suele venir en remoteJidAlt / senderPn.
+     * Si solo hay @lid, hay que responder a "digits@lid" o Evolution responde exists:false.
+     *
+     * @return array{phone_e164: string|null, reply_to: string|null}
+     */
+    private function resolveAddress(string $remoteJid, string $remoteJidAlt, string $senderPn, array $item): array
+    {
+        $candidates = array_values(array_filter([
+            $remoteJidAlt,
+            $senderPn,
+            (string) data_get($item, 'senderPn', ''),
+            (string) ($item['key']['participant'] ?? ''),
+            (string) ($item['participant'] ?? ''),
+            $remoteJid,
+        ], fn ($v) => is_string($v) && trim($v) !== ''));
+
+        $phone = null;
+        $lidJid = null;
+
+        foreach ($candidates as $candidate) {
+            $candidate = trim($candidate);
+
+            // Solo dígitos (senderPn a veces viene así)
+            if (! str_contains($candidate, '@')) {
+                $digits = preg_replace('/\D+/', '', $candidate) ?? '';
+                if (strlen($digits) >= 8 && strlen($digits) <= 15) {
+                    $phone = $phone ?? '+'.$digits;
+                }
+                continue;
+            }
+
+            if (str_contains($candidate, '@g.us') || str_contains($candidate, '@broadcast')) {
+                continue;
+            }
+
+            if (str_contains($candidate, '@lid')) {
+                $lidJid = $lidJid ?? $candidate;
+                continue;
+            }
+
+            // @s.whatsapp.net u otros JID con teléfono real
+            $asPhone = $this->jidToPhone($candidate);
+            if ($asPhone) {
+                $phone = $phone ?? $asPhone;
+            }
+        }
+
+        if ($phone) {
+            return [
+                'phone_e164' => $phone,
+                'reply_to' => ltrim($phone, '+'),
+            ];
+        }
+
+        if ($lidJid) {
+            $digits = preg_replace('/\D+/', '', explode('@', $lidJid)[0] ?? '') ?? '';
+
+            return [
+                'phone_e164' => $digits !== '' ? '+'.$digits : null,
+                'reply_to' => $lidJid,
+            ];
+        }
+
+        return [
+            'phone_e164' => null,
+            'reply_to' => null,
+        ];
+    }
+
     private function jidToPhone(string $jid): ?string
     {
         if ($jid === '') {
@@ -216,7 +293,7 @@ class IncomingMessageNormalizer
         }
 
         // 58412...@s.whatsapp.net  |  1203...@g.us (grupo: ignoramos)
-        if (str_contains($jid, '@g.us')) {
+        if (str_contains($jid, '@g.us') || str_contains($jid, '@lid')) {
             return null;
         }
 

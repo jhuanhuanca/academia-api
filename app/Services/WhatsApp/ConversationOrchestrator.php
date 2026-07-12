@@ -47,7 +47,10 @@ class ConversationOrchestrator
             return ['skipped' => true, 'reason' => 'no_phone'];
         }
 
-        return DB::transaction(function () use ($instance, $incoming, $phone) {
+        // Preferir destino real (remoteJidAlt) o JID @lid; si no, el phone_e164
+        $replyTo = (string) ($incoming['reply_to'] ?? ltrim($phone, '+'));
+
+        return DB::transaction(function () use ($instance, $incoming, $phone, $replyTo) {
             $lead = Lead::query()->firstOrCreate(
                 [
                     'tenant_id' => $instance->tenant_id,
@@ -69,12 +72,19 @@ class ConversationOrchestrator
             if (! $conversation) {
                 $this->evolution->sendText(
                     $instance->evolution_instance,
-                    $phone,
+                    $replyTo,
                     'Hola, aún no hay un flujo publicado en MarketLuna. Configura uno en el dashboard.'
                 );
 
                 return ['skipped' => true, 'reason' => 'no_flow'];
             }
+
+            // Guardar destino de respuesta (evita exists:false con @lid)
+            $conversation->forceFill([
+                'context' => array_merge($conversation->context ?? [], [
+                    'reply_to' => $replyTo,
+                ]),
+            ])->save();
 
             if (! empty($incoming['wa_message_id'])) {
                 $exists = Message::query()
@@ -102,10 +112,14 @@ class ConversationOrchestrator
                 ?? $this->resolveStartNode($flow);
 
             // Conversación trabada (pago/handoff) + saludo → reiniciar flujo
+            // Nunca reiniciar si está en menú de botones esperando una opción (1, 2, qr…)
+            $bodyText = (string) ($incoming['body'] ?? '');
             if (
                 $current
                 && in_array($conversation->status, ['waiting_payment', 'handed_off'], true)
-                && $this->looksLikeRestart((string) ($incoming['body'] ?? ''))
+                && ! ($current->type === 'buttons' || $current->type === 'list')
+                && $this->looksLikeRestart($bodyText)
+                && ! $this->looksLikeMenuChoice($bodyText)
             ) {
                 $conversation->forceFill([
                     'status' => 'closed',
@@ -118,12 +132,22 @@ class ConversationOrchestrator
                     return ['skipped' => true, 'reason' => 'no_flow_after_restart'];
                 }
 
-                return $this->runFromStart($instance, $conversation, $flow, $lead, $phone);
+                return $this->runFromStart($instance, $conversation, $flow, $lead, $replyTo);
             }
 
             // Primera entrada o nodo start inválido/borrado → cadena desde inicio
+            // Si ya hay menú activo (waiting_input + buttons), NO reiniciar aunque el nodo falle
+            if ((! $current || $current->type === 'start') && $conversation->status !== 'waiting_input') {
+                return $this->runFromStart($instance, $conversation, $flow, $lead, $replyTo);
+            }
+
             if (! $current || $current->type === 'start') {
-                return $this->runFromStart($instance, $conversation, $flow, $lead, $phone);
+                // Recuperar menú de botones si la conversación espera input
+                $current = $this->resolveWaitingButtonsNode($flow, $conversation) ?? $current;
+            }
+
+            if (! $current || $current->type === 'start') {
+                return $this->runFromStart($instance, $conversation, $flow, $lead, $replyTo);
             }
 
             $triggerType = 'default';
@@ -136,10 +160,9 @@ class ConversationOrchestrator
                 $triggerType = 'list';
                 $triggerKey = (string) $incoming['list_id'];
             } elseif ($current && $current->type === 'ai_reply') {
-                return $this->handleAiNode($instance, $conversation, $flow, $current, $lead, $phone, (string) ($incoming['body'] ?? ''));
-            } elseif ($current && in_array($current->type, ['buttons', 'list'], true) && ! empty($incoming['body'])) {
-                // Texto libre sobre menú → intentar match por label o pasar a ai si existe edge
-                $matched = $this->matchButtonByLabel($current, (string) $incoming['body']);
+                return $this->handleAiNode($instance, $conversation, $flow, $current, $lead, $phone, $bodyText);
+            } elseif ($current && in_array($current->type, ['buttons', 'list'], true) && trim($bodyText) !== '') {
+                $matched = $this->matchButtonByLabel($current, $bodyText);
                 if ($matched) {
                     $triggerType = 'button';
                     $triggerKey = $matched;
@@ -148,12 +171,12 @@ class ConversationOrchestrator
                         $instance,
                         $conversation,
                         $phone,
-                        'Por favor elige una de las opciones del menú 🙂',
+                        'Por favor responde con el *número* de la opción (1, 2, 3…) o el nombre (ej. QR, Tigo).',
                         'text',
                         $current->id
                     );
 
-                    return ['ok' => true, 'action' => 'reprompt_buttons'];
+                    return ['ok' => true, 'action' => 'reprompt_buttons', 'body' => $bodyText];
                 }
             } elseif ($current && $current->type === 'wait_payment') {
                 return app(PaymentConfirmationService::class)->handleReceiptSubmission(
@@ -164,15 +187,29 @@ class ConversationOrchestrator
                     $incoming
                 );
             } else {
-                // Nodo message u otros: avanzar default
                 $triggerType = 'default';
                 $triggerKey = '';
             }
 
             $advanced = $this->flowRunner->advance($flow, $current, $triggerType, $triggerKey);
             $next = $advanced['node'];
+            $edge = $advanced['edge'] ?? null;
 
-            if (! $next) {
+            // Botón elegido pero sin conexión configurada → no reejecutar el menú ni reiniciar
+            if ($triggerType === 'button' && ! $edge) {
+                $this->sendOutbound(
+                    $instance,
+                    $conversation,
+                    $phone,
+                    "Elegiste *{$triggerKey}*, pero esa opción aún no está conectada en el flujo. Revisa Flow Builder (conexiones del botón).",
+                    'text',
+                    $current->id
+                );
+
+                return ['ok' => false, 'action' => 'button_without_edge', 'trigger_key' => $triggerKey];
+            }
+
+            if (! $next || ($edge === null && $triggerType === 'button')) {
                 $this->sendOutbound(
                     $instance,
                     $conversation,
@@ -183,6 +220,20 @@ class ConversationOrchestrator
                 );
 
                 return ['ok' => true, 'action' => 'no_edge'];
+            }
+
+            // Evitar re-ejecutar el mismo nodo de botones (parecía un “reinicio”)
+            if ($next->id === $current->id && in_array($current->type, ['buttons', 'list'], true)) {
+                $this->sendOutbound(
+                    $instance,
+                    $conversation,
+                    $phone,
+                    'Por favor elige una de las opciones del menú con el *número* o el nombre 🙂',
+                    'text',
+                    $current->id
+                );
+
+                return ['ok' => true, 'action' => 'same_node_reprompt'];
             }
 
             return $this->executeNodeChain($instance, $conversation, $flow, $lead, $phone, $next);
@@ -328,7 +379,7 @@ class ConversationOrchestrator
     private function looksLikeRestart(string $body): bool
     {
         $text = mb_strtolower(trim($body));
-        if ($text === '') {
+        if ($text === '' || $this->looksLikeMenuChoice($text)) {
             return false;
         }
 
@@ -341,6 +392,73 @@ class ConversationOrchestrator
         }
 
         return false;
+    }
+
+    private function looksLikeMenuChoice(string $body): bool
+    {
+        $text = $this->normalizeMenuText($body);
+        if ($text === '') {
+            return false;
+        }
+
+        if (preg_match('/^\d{1,2}([).:\-]|️⃣)?$/u', $text)) {
+            return true;
+        }
+
+        if (preg_match('/^(opci[oó]n|option|n[uú]mero|#)\s*\d{1,2}$/u', $text)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function normalizeMenuText(string $text): string
+    {
+        $text = mb_strtolower(trim($text));
+        $text = preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u', '', $text) ?? $text;
+
+        $keycaps = [
+            '1️⃣' => '1', '2️⃣' => '2', '3️⃣' => '3', '4️⃣' => '4', '5️⃣' => '5',
+            '6️⃣' => '6', '7️⃣' => '7', '8️⃣' => '8', '9️⃣' => '9', '🔟' => '10',
+            '1⃣' => '1', '2⃣' => '2', '3⃣' => '3', '4⃣' => '4', '5⃣' => '5', '6⃣' => '6',
+        ];
+        $text = strtr($text, $keycaps);
+        $text = preg_replace('/\s+/u', ' ', $text) ?? $text;
+
+        return trim($text);
+    }
+
+    private function resolveWaitingButtonsNode(Flow $flow, Conversation $conversation): ?FlowNode
+    {
+        if ($conversation->status !== 'waiting_input') {
+            return null;
+        }
+
+        return FlowNode::query()
+            ->where('flow_id', $flow->id)
+            ->whereIn('type', ['buttons', 'list'])
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function buttonList(FlowNode $node): array
+    {
+        $buttons = $node->config['buttons'] ?? [];
+        if (! is_array($buttons)) {
+            return [];
+        }
+
+        $list = [];
+        foreach ($buttons as $button) {
+            if (is_array($button)) {
+                $list[] = $button;
+            }
+        }
+
+        return array_values($list);
     }
 
     /**
@@ -445,6 +563,7 @@ class ConversationOrchestrator
         $buttons = is_array($config['buttons'] ?? null) ? $config['buttons'] : [];
         $footer = is_string($config['footer'] ?? null) ? $config['footer'] : 'MarketLuna';
         $preferNative = (bool) ($config['native_buttons'] ?? false);
+        $destination = $this->resolveDestination($conversation, $phone);
 
         // Baileys: los botones nativos suelen fallar en WhatsApp Web
         // ("No se pudo cargar este mensaje"). Menú numerado = fiable.
@@ -458,7 +577,7 @@ class ConversationOrchestrator
             try {
                 $response = $this->evolution->sendButtons(
                     $instance->evolution_instance,
-                    $phone,
+                    $destination,
                     $titleLine !== '' ? $titleLine : 'Opciones',
                     $description !== '' ? $description : $text,
                     $buttons,
@@ -649,7 +768,7 @@ class ConversationOrchestrator
                 $response = $this->mediaService->sendImage(
                     $this->evolution,
                     $instance->evolution_instance,
-                    $phone,
+                    $this->resolveDestination($conversation, $phone),
                     $qrAsset,
                     '📲 Escanea este QR para pagar'
                 );
@@ -829,13 +948,16 @@ class ConversationOrchestrator
         string $type = 'text',
         ?int $nodeId = null
     ): void {
+        $destination = $this->resolveDestination($conversation, $phone);
+
         try {
-            $response = $this->evolution->sendText($instance->evolution_instance, $phone, $text);
+            $response = $this->evolution->sendText($instance->evolution_instance, $destination, $text);
             $this->storeOutbound($instance, $conversation, $nodeId, $type, $text, $response);
         } catch (Throwable $e) {
             Log::error('Evolution sendText failed', [
                 'error' => $e->getMessage(),
                 'phone' => $phone,
+                'destination' => $destination,
             ]);
             Message::create([
                 'tenant_id' => $instance->tenant_id,
@@ -843,12 +965,22 @@ class ConversationOrchestrator
                 'direction' => 'outbound',
                 'type' => $type,
                 'body' => $text,
-                'payload' => ['error' => $e->getMessage()],
+                'payload' => ['error' => $e->getMessage(), 'destination' => $destination],
                 'flow_node_id' => $nodeId,
                 'status' => 'failed',
                 'created_at' => now(),
             ]);
         }
+    }
+
+    private function resolveDestination(Conversation $conversation, string $phone): string
+    {
+        $fromContext = data_get($conversation->context ?? [], 'reply_to');
+        if (is_string($fromContext) && trim($fromContext) !== '') {
+            return trim($fromContext);
+        }
+
+        return $phone;
     }
 
     /**
@@ -923,31 +1055,49 @@ class ConversationOrchestrator
      */
     private function matchButtonByLabel(FlowNode $node, string $text): ?string
     {
-        $buttons = $node->config['buttons'] ?? [];
-        $needle = mb_strtolower(trim($text));
-        $needleNorm = preg_replace('/\s+/', ' ', $needle) ?? $needle;
+        $buttons = array_slice($this->buttonList($node), 0, 6);
+        if ($buttons === []) {
+            return null;
+        }
 
-        // "1" / "1)" / "opcion 1" → primer botón
-        if (preg_match('/^(\d+)\s*\)?$/', $needleNorm, $m)) {
+        $needleNorm = $this->normalizeMenuText($text);
+
+        // "1" / "1)" / "1." / "opción 1" / "1️⃣"
+        if (
+            preg_match('/^(?:opci[oó]n|option|n[uú]mero|#)\s*(\d{1,2})$/u', $needleNorm, $m)
+            || preg_match('/^(\d{1,2})\s*[).:\-]*$/u', $needleNorm, $m)
+        ) {
             $idx = ((int) $m[1]) - 1;
-            if (isset($buttons[$idx]['id']) && $buttons[$idx]['id'] !== '') {
-                return (string) $buttons[$idx]['id'];
+            if (isset($buttons[$idx])) {
+                $id = trim((string) ($buttons[$idx]['id'] ?? ''));
+                if ($id !== '') {
+                    return $id;
+                }
             }
         }
 
         foreach ($buttons as $button) {
-            $label = mb_strtolower(trim((string) ($button['label'] ?? '')));
-            $id = (string) ($button['id'] ?? '');
-            $labelNorm = preg_replace('/\s+/', ' ', $label) ?? $label;
+            $label = $this->normalizeMenuText((string) ($button['label'] ?? ''));
+            $id = trim((string) ($button['id'] ?? ''));
+            $idNorm = mb_strtolower($id);
 
-            if ($labelNorm !== '' && ($needleNorm === $labelNorm || str_contains($needleNorm, $labelNorm) || str_contains($labelNorm, $needleNorm))) {
+            $labelPlain = trim(preg_replace('/\p{So}|\p{Sk}/u', '', $label) ?? $label);
+            $labelPlain = trim(preg_replace('/\s+/u', ' ', $labelPlain) ?? $labelPlain);
+
+            if ($idNorm !== '' && ($needleNorm === $idNorm || str_contains($needleNorm, $idNorm))) {
+                return $id;
+            }
+
+            if ($labelPlain !== '' && (
+                $needleNorm === $labelPlain
+                || str_contains($labelPlain, $needleNorm)
+                || str_contains($needleNorm, $labelPlain)
+            )) {
                 return $id !== '' ? $id : null;
             }
-            if ($id !== '' && $needleNorm === mb_strtolower($id)) {
-                return $id;
-            }
-            if ($id !== '' && str_contains($needleNorm, mb_strtolower($id))) {
-                return $id;
+
+            if ($label !== '' && ($needleNorm === $label || str_contains($label, $needleNorm))) {
+                return $id !== '' ? $id : null;
             }
         }
 
