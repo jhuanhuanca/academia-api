@@ -9,7 +9,9 @@ use App\Http\Controllers\Api\KnowledgeItemController;
 use App\Http\Controllers\Api\LunaController;
 use App\Http\Controllers\Api\MediaAssetController;
 use App\Http\Controllers\Api\SalesController;
+use App\Http\Controllers\Api\TeamMemberController;
 use App\Http\Controllers\Api\Webhooks\EvolutionWebhookController;
+use App\Http\Controllers\Api\Webhooks\MetaCloudWebhookController;
 use App\Http\Controllers\Api\WhatsappInstanceController;
 use Illuminate\Support\Facades\Route;
 
@@ -24,9 +26,15 @@ Route::get('/health', function () {
 // Webhook público (Evolution → MarketLuna). Debe responder rápido.
 Route::post('/webhooks/evolution', EvolutionWebhookController::class);
 
+// WhatsApp Cloud API (Meta) — GET verify + POST eventos
+Route::get('/webhooks/meta', [MetaCloudWebhookController::class, 'verify']);
+Route::post('/webhooks/meta', MetaCloudWebhookController::class);
+
 Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login']);
     Route::post('/register', [AuthController::class, 'register']);
+    Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
+    Route::post('/reset-password', [AuthController::class, 'resetPassword']);
 });
 
 Route::middleware('auth:sanctum')->group(function () {
@@ -56,6 +64,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/whatsapp-instances', [WhatsappInstanceController::class, 'index']);
     Route::post('/whatsapp-instances', [WhatsappInstanceController::class, 'store']);
     Route::get('/whatsapp-instances/{whatsappInstance}', [WhatsappInstanceController::class, 'show']);
+    Route::patch('/whatsapp-instances/{whatsappInstance}', [WhatsappInstanceController::class, 'update']);
     Route::post('/whatsapp-instances/{whatsappInstance}/connect', [WhatsappInstanceController::class, 'connect']);
     Route::post('/whatsapp-instances/{whatsappInstance}/connect-demo', [WhatsappInstanceController::class, 'connectDemo']);
     Route::post('/whatsapp-instances/{whatsappInstance}/simulate-inbound', [WhatsappInstanceController::class, 'simulateInbound']);
@@ -68,6 +77,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/sales', [SalesController::class, 'index']);
     Route::post('/sales/{sale}/confirm-payment', [SalesController::class, 'confirmPayment']);
     Route::get('/media-assets/{mediaAsset}', [MediaAssetController::class, 'show']);
+
+    Route::get('/team-members', [TeamMemberController::class, 'index']);
+    Route::post('/team-members', [TeamMemberController::class, 'store']);
+    Route::patch('/team-members/{user}', [TeamMemberController::class, 'update']);
 
     Route::get('/luna/health', [LunaController::class, 'health']);
     Route::post('/luna/decide', [LunaController::class, 'decide']);

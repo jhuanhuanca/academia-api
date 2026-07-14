@@ -91,7 +91,7 @@ class CreateTenantCommand extends Command
             'name' => 'Principal',
             'evolution_instance' => $waName,
             'evolution_apikey' => null,
-            'integration' => 'baileys',
+            'integration' => 'meta_cloud',
             'status' => 'disconnected',
             'webhook_secret' => Str::random(48),
             'meta' => [],
@@ -108,13 +108,13 @@ class CreateTenantCommand extends Command
                 ['Usuario', $user->name],
                 ['Email login', $user->email],
                 ['Password', $password],
-                ['WhatsApp Evolution', $instance->evolution_instance],
+                ['WhatsApp', 'meta_cloud (Cloud API)'],
             ]
         );
         $this->newLine();
         $this->line('Siguiente:');
         $this->line('1) El usuario entra al panel con su email/password');
-        $this->line('2) Va a WhatsApp → Conectar → escanea el QR con SU teléfono');
+        $this->line('2) Va a WhatsApp → activa Cloud API con Phone Number ID + token Meta');
         $this->line('3) Crea su curso, sube su QR de pago y publica su flujo');
         $this->line('4) Sus ventas quedan solo en su tenant (no ve las de otros)');
 

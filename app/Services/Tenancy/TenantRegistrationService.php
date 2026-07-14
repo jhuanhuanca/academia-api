@@ -72,7 +72,7 @@ class TenantRegistrationService
                 'name' => 'Principal',
                 'evolution_instance' => $waName,
                 'evolution_apikey' => null,
-                'integration' => 'baileys',
+                'integration' => 'meta_cloud',
                 'status' => 'disconnected',
                 'webhook_secret' => Str::random(48),
                 'meta' => [],
@@ -116,6 +116,10 @@ class TenantRegistrationService
             ])->save();
 
             $user->tenant?->forceFill(['status' => 'active'])->save();
+
+            if ($user->tenant) {
+                app(TenantCatalogBootstrapService::class)->bootstrapIfEmpty($user->tenant);
+            }
         });
 
         return ['ok' => true, 'user' => $user->fresh(['tenant'])];

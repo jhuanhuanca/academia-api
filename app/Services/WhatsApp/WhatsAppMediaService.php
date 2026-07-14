@@ -11,8 +11,10 @@ use Throwable;
 
 class WhatsAppMediaService
 {
-    public function __construct(private readonly EvolutionClient $evolution)
-    {
+    public function __construct(
+        private readonly EvolutionClient $evolution,
+        private readonly WhatsAppMessengerResolver $messengers,
+    ) {
     }
 
     /**
@@ -69,6 +71,24 @@ class WhatsAppMediaService
         }
 
         $lastError = null;
+
+        // Meta Cloud API: descarga por media id
+        if ($instance->usesMetaCloud()) {
+            $downloaded = $this->messengers->for($instance)->downloadInboundMedia($instance, $incoming);
+            if ($downloaded) {
+                try {
+                    return $this->storeFromBase64(
+                        $instance->tenant_id,
+                        $downloaded['base64'],
+                        'receipt-wa',
+                        $downloaded['mime']
+                    );
+                } catch (Throwable $e) {
+                    Log::warning('Meta media base64 inválido', ['error' => $e->getMessage()]);
+                }
+            }
+        }
+
         $payloads = $this->buildMediaPayloadVariants($raw);
 
         // Evolution a veces indexa el mensaje 1-2s después del webhook
@@ -319,14 +339,20 @@ class WhatsAppMediaService
             str_contains($mime, 'png') => 'png',
             str_contains($mime, 'pdf') => 'pdf',
             str_contains($mime, 'webp') => 'webp',
+            str_contains($mime, 'mp4') => 'mp4',
+            str_contains($mime, '3gpp') || str_contains($mime, '3gp') => '3gp',
+            str_contains($mime, 'quicktime') => 'mov',
+            str_contains($mime, 'webm') => 'webm',
+            str_contains($mime, 'video') => 'mp4',
             default => 'jpg',
         };
 
         // Todo el media de WhatsApp vive en disco public (permisos OK en VPS).
-        // payment-qr/{tenant}/{id}.ext | receipts/{tenant}/{id}.ext | uploads/...
+        // payment-qr/{tenant}/{id}.ext | receipts/{tenant}/{id}.ext | flow-media/... | uploads/...
         $folder = match (true) {
             str_starts_with($prefix, 'payment-qr') => 'payment-qr',
             str_starts_with($prefix, 'receipt') => 'receipts',
+            str_starts_with($prefix, 'flow-media') => 'flow-media',
             default => 'uploads',
         };
 
@@ -408,13 +434,12 @@ class WhatsAppMediaService
     }
 
     /**
-     * Envía imagen a WhatsApp: multipart (preferido) → base64 → URL.
+     * Envía imagen a WhatsApp (Meta Cloud o Evolution).
      *
      * @return array<string, mixed>
      */
     public function sendImage(
-        EvolutionClient $evolution,
-        string $instance,
+        WhatsappInstance $instance,
         string $number,
         MediaAsset $asset,
         string $caption
@@ -431,7 +456,7 @@ class WhatsAppMediaService
         $errors = [];
 
         try {
-            return $evolution->sendMediaFile(
+            return $this->messengers->for($instance)->sendMediaBinary(
                 $instance,
                 $number,
                 $binary,
@@ -441,42 +466,110 @@ class WhatsAppMediaService
                 $caption !== '' ? mb_substr($caption, 0, 900) : null
             );
         } catch (Throwable $e) {
-            $errors[] = 'multipart: '.$e->getMessage();
-            Log::warning('sendMediaFile falló', ['error' => $e->getMessage()]);
+            $errors[] = 'binary: '.$e->getMessage();
+            Log::warning('sendMediaBinary falló', [
+                'error' => $e->getMessage(),
+                'integration' => $instance->integration,
+            ]);
         }
 
-        try {
-            return $evolution->sendMedia(
-                $instance,
-                $number,
-                base64_encode($binary),
-                'image',
-                $caption !== '' ? mb_substr($caption, 0, 900) : null,
-                $fileName,
-                $mime
-            );
-        } catch (Throwable $e) {
-            $errors[] = 'raw64: '.$e->getMessage();
-        }
-
-        $url = $this->publicUrl($asset);
-        if ($url) {
-            try {
-                return $evolution->sendMedia(
-                    $instance,
-                    $number,
-                    $url,
-                    'image',
-                    $caption !== '' ? mb_substr($caption, 0, 900) : null,
-                    $fileName,
-                    $mime
-                );
-            } catch (Throwable $e) {
-                $errors[] = 'url: '.$e->getMessage();
+        if (! $instance->usesMetaCloud()) {
+            $url = $this->publicUrl($asset);
+            if ($url) {
+                try {
+                    return $this->evolution->sendMedia(
+                        $instance->evolution_instance,
+                        $number,
+                        $url,
+                        'image',
+                        $caption !== '' ? mb_substr($caption, 0, 900) : null,
+                        $fileName,
+                        $mime
+                    );
+                } catch (Throwable $e) {
+                    $errors[] = 'url: '.$e->getMessage();
+                }
             }
         }
 
         throw new \RuntimeException('No se pudo enviar imagen: '.implode(' | ', $errors));
+    }
+
+    /**
+     * Envía imagen o video (nodo send_media del Flow Builder).
+     *
+     * @return array<string, mixed>
+     */
+    public function sendMediaAsset(
+        WhatsappInstance $instance,
+        string $number,
+        MediaAsset $asset,
+        string $caption = '',
+        ?string $mediatype = null
+    ): array {
+        $binary = $this->readBinary($asset);
+        if ($binary === null) {
+            throw new \RuntimeException('Archivo media no encontrado (asset #'.$asset->id.')');
+        }
+
+        $mime = $asset->mime ?: 'application/octet-stream';
+        $type = $mediatype ?: (str_starts_with($mime, 'video/') ? 'video' : 'image');
+        if (! in_array($type, ['image', 'video', 'document', 'audio'], true)) {
+            $type = 'image';
+        }
+
+        $ext = match (true) {
+            str_contains($mime, 'png') => 'png',
+            str_contains($mime, 'webp') => 'webp',
+            str_contains($mime, 'mp4') => 'mp4',
+            str_contains($mime, '3gp') => '3gp',
+            str_contains($mime, 'webm') => 'webm',
+            $type === 'video' => 'mp4',
+            default => 'jpg',
+        };
+        $fileName = ($type === 'video' ? 'video' : 'imagen').'-'.$asset->id.'.'.$ext;
+        $cap = $caption !== '' ? mb_substr($caption, 0, 900) : null;
+        $errors = [];
+
+        try {
+            return $this->messengers->for($instance)->sendMediaBinary(
+                $instance,
+                $number,
+                $binary,
+                $fileName,
+                $mime,
+                $type,
+                $cap
+            );
+        } catch (Throwable $e) {
+            $errors[] = 'binary: '.$e->getMessage();
+            Log::warning('sendMediaBinary falló', [
+                'error' => $e->getMessage(),
+                'type' => $type,
+                'integration' => $instance->integration,
+            ]);
+        }
+
+        if (! $instance->usesMetaCloud()) {
+            $url = $this->publicUrl($asset);
+            if ($url) {
+                try {
+                    return $this->evolution->sendMedia(
+                        $instance->evolution_instance,
+                        $number,
+                        $url,
+                        $type,
+                        $cap,
+                        $fileName,
+                        $mime
+                    );
+                } catch (Throwable $e) {
+                    $errors[] = 'url: '.$e->getMessage();
+                }
+            }
+        }
+
+        throw new \RuntimeException('No se pudo enviar '.$type.': '.implode(' | ', $errors));
     }
 
     /**

@@ -16,7 +16,12 @@ class MediaAssetController extends Controller
     public function store(Request $request, WhatsAppMediaService $mediaService): JsonResponse
     {
         $data = $request->validate([
-            'file' => ['required', 'file', 'max:5120', 'mimes:jpg,jpeg,png,webp,pdf'],
+            'file' => [
+                'required',
+                'file',
+                'max:20480', // 20 MB (videos cortos para WhatsApp)
+                'mimes:jpg,jpeg,png,webp,pdf,mp4,3gp,mov,webm',
+            ],
             'purpose' => ['nullable', 'string', 'max:40'],
         ]);
 
@@ -27,10 +32,15 @@ class MediaAssetController extends Controller
             return response()->json(['message' => 'No se pudo leer el archivo'], 422);
         }
 
+        $purpose = $data['purpose'] ?? 'upload';
+        if (str_starts_with((string) $mime, 'video/') && $purpose === 'upload') {
+            $purpose = 'flow-media';
+        }
+
         $asset = $mediaService->storeFromBase64(
             $request->user()->tenant_id,
             'data:'.$mime.';base64,'.base64_encode($binary),
-            $data['purpose'] ?? 'upload',
+            $purpose,
             $mime
         );
 

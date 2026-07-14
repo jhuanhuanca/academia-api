@@ -33,7 +33,7 @@ class FlowRunner
         // o la única salida si el usuario configuró mal el trigger (ej. ai_transition).
         if (
             $fromNode
-            && in_array($fromNode->type, ['start', 'message', 'send_payment_qr'], true)
+            && in_array($fromNode->type, ['start', 'message', 'send_payment_qr', 'send_media'], true)
             && $triggerType === 'default'
         ) {
             $edge = $this->findEdge($flow->id, $fromNode->id, 'default', '');
@@ -71,6 +71,17 @@ class FlowRunner
                 ->where('from_node_id', $fromId)
                 ->where('trigger_key', $triggerKey)
                 ->orderByDesc('priority')
+                ->first();
+        }
+
+        // Catálogo dinámico: course_123 → edge "catalog" / "product" / "course"
+        if (! $edge && $triggerType === 'button' && is_string($triggerKey) && preg_match('/^course_\d+$/', $triggerKey)) {
+            $edge = FlowEdge::query()
+                ->where('flow_id', $flow->id)
+                ->where('from_node_id', $fromId)
+                ->where('trigger_type', 'button')
+                ->whereIn('trigger_key', ['catalog', 'product', 'course', 'buy'])
+                ->orderBy('priority')
                 ->first();
         }
 

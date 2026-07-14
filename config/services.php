@@ -45,6 +45,22 @@ return [
         'webhook_url' => env('EVOLUTION_WEBHOOK_URL', 'http://host.docker.internal:8000/api/webhooks/evolution'),
     ],
 
+    /*
+    | WhatsApp Cloud API (Meta oficial). Fallback global; preferir campos por instancia.
+    */
+    'meta_whatsapp' => [
+        'graph_base' => env('META_WA_GRAPH_BASE', 'https://graph.facebook.com'),
+        'graph_version' => env('META_WA_GRAPH_VERSION', 'v21.0'),
+        'access_token' => env('META_WA_ACCESS_TOKEN'),
+        'phone_number_id' => env('META_WA_PHONE_NUMBER_ID'),
+        'waba_id' => env('META_WA_WABA_ID'),
+        'app_secret' => env('META_WA_APP_SECRET'),
+        'verify_token' => env('META_WA_VERIFY_TOKEN', 'marketluna-meta-verify'),
+        'timeout' => (float) env('META_WA_TIMEOUT', 60),
+        // Solo para local/dev sin firma; en prod deja false y configura APP_SECRET
+        'allow_unsigned_webhooks' => (bool) env('META_WA_ALLOW_UNSIGNED', false),
+    ],
+
     'frontend_url' => env('FRONTEND_URL', 'http://127.0.0.1:5173'),
 
     'payments' => [

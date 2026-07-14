@@ -3,9 +3,10 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Sale;
 use App\Models\Payment;
+use App\Models\Sale;
 use App\Services\Payments\PaymentConfirmationService;
+use App\Support\DatePeriodFilter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -13,18 +14,25 @@ class SalesController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
-        $sales = Sale::query()
+        $query = Sale::query()
             ->where('tenant_id', $request->user()->tenant_id)
             ->with([
                 'lead:id,name,phone_e164',
                 'course:id,title',
                 'payments' => fn ($q) => $q->latest()->with('receiptMedia:id,path,disk,mime'),
-            ])
+            ]);
+
+        DatePeriodFilter::apply($query, $request, 'created_at');
+
+        $sales = $query
             ->orderByDesc('id')
-            ->limit(100)
+            ->limit(200)
             ->get();
 
-        return response()->json(['data' => $sales]);
+        return response()->json([
+            'data' => $sales,
+            'meta' => DatePeriodFilter::meta($request),
+        ]);
     }
 
     public function confirmPayment(

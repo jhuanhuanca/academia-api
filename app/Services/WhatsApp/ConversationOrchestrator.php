@@ -23,7 +23,7 @@ use Throwable;
 class ConversationOrchestrator
 {
     public function __construct(
-        private readonly EvolutionClient $evolution,
+        private readonly WhatsAppMessengerResolver $messengers,
         private readonly FlowRunner $flowRunner,
         private readonly LunaClient $luna,
         private readonly WhatsAppMediaService $mediaService,
@@ -70,8 +70,8 @@ class ConversationOrchestrator
 
             $conversation = $this->resolveConversation($instance, $lead);
             if (! $conversation) {
-                $this->evolution->sendText(
-                    $instance->evolution_instance,
+                $this->messengers->for($instance)->sendText(
+                    $instance,
                     $replyTo,
                     'Hola, aún no hay un flujo publicado en MarketLuna. Configura uno en el dashboard.'
                 );
@@ -156,9 +156,11 @@ class ConversationOrchestrator
             if (($incoming['type'] ?? '') === 'button_reply' && ! empty($incoming['button_id'])) {
                 $triggerType = 'button';
                 $triggerKey = (string) $incoming['button_id'];
+                $this->rememberSelectedProduct($conversation, $triggerKey);
             } elseif (($incoming['type'] ?? '') === 'list_reply' && ! empty($incoming['list_id'])) {
                 $triggerType = 'list';
                 $triggerKey = (string) $incoming['list_id'];
+                $this->rememberSelectedProduct($conversation, $triggerKey);
             } elseif ($current && $current->type === 'ai_reply') {
                 return $this->handleAiNode($instance, $conversation, $flow, $current, $lead, $phone, $bodyText);
             } elseif ($current && in_array($current->type, ['buttons', 'list'], true) && trim($bodyText) !== '') {
@@ -166,6 +168,7 @@ class ConversationOrchestrator
                 if ($matched) {
                     $triggerType = 'button';
                     $triggerKey = $matched;
+                    $this->rememberSelectedProduct($conversation, $matched);
                 } else {
                     $this->sendOutbound(
                         $instance,
@@ -446,7 +449,39 @@ class ConversationOrchestrator
      */
     private function buttonList(FlowNode $node): array
     {
-        $buttons = $node->config['buttons'] ?? [];
+        $config = is_array($node->config) ? $node->config : [];
+
+        // Catálogo dinámico desde productos activos del tenant
+        if (($config['source'] ?? '') === 'courses') {
+            $flow = Flow::query()->find($node->flow_id);
+            if (! $flow) {
+                return [];
+            }
+
+            return Course::query()
+                ->where('tenant_id', $flow->tenant_id)
+                ->where('is_active', true)
+                ->orderBy('sort_order')
+                ->orderBy('id')
+                ->limit(6)
+                ->get()
+                ->map(function (Course $course) {
+                    $price = rtrim(rtrim(number_format((float) $course->price, 2, '.', ''), '0'), '.');
+                    $short = $course->title;
+                    if (mb_strlen($short) > 20) {
+                        $short = mb_substr($short, 0, 19).'…';
+                    }
+
+                    return [
+                        'id' => 'course_'.$course->id,
+                        'label' => $short,
+                        'display' => "{$course->title} — {$price} {$course->currency}",
+                    ];
+                })
+                ->all();
+        }
+
+        $buttons = $config['buttons'] ?? [];
         if (! is_array($buttons)) {
             return [];
         }
@@ -459,6 +494,43 @@ class ConversationOrchestrator
         }
 
         return array_values($list);
+    }
+
+    private function rememberSelectedProduct(Conversation $conversation, string $buttonId): void
+    {
+        if (! preg_match('/^course_(\d+)$/', $buttonId, $m)) {
+            return;
+        }
+
+        $courseId = (int) $m[1];
+        $conversation->forceFill([
+            'context' => array_merge($conversation->context ?? [], [
+                'selected_course_id' => $courseId,
+                'course_id' => $courseId,
+            ]),
+        ])->save();
+    }
+
+    private function resolveSaleCourseId(WhatsappInstance $instance, Conversation $conversation, array $config): ?int
+    {
+        $fromContext = data_get($conversation->context, 'selected_course_id')
+            ?? data_get($conversation->context, 'course_id');
+        if ($fromContext) {
+            return (int) $fromContext;
+        }
+
+        if (! empty($config['course_id'])) {
+            return (int) $config['course_id'];
+        }
+
+        $fallback = Course::query()
+            ->where('tenant_id', $instance->tenant_id)
+            ->where('is_active', true)
+            ->orderBy('sort_order')
+            ->orderBy('id')
+            ->value('id');
+
+        return $fallback ? (int) $fallback : null;
     }
 
     /**
@@ -525,6 +597,7 @@ class ConversationOrchestrator
                 'text',
                 $node->id
             ),
+            'send_media' => $this->sendMediaNode($instance, $conversation, $phone, $node, $config),
             'buttons' => $this->sendButtonsNode($instance, $conversation, $phone, $node, $config),
             'ai_reply' => null,
             'send_payment_qr' => $this->sendPaymentQr($instance, $conversation, $lead, $phone, $node, $config),
@@ -552,6 +625,89 @@ class ConversationOrchestrator
     /**
      * @param  array<string, mixed>  $config
      */
+    private function sendMediaNode(
+        WhatsappInstance $instance,
+        Conversation $conversation,
+        string $phone,
+        FlowNode $node,
+        array $config
+    ): void {
+        $assetId = (int) ($config['media_asset_id'] ?? 0);
+        $caption = trim((string) ($config['caption'] ?? $config['text'] ?? ''));
+        $mediaType = (string) ($config['media_type'] ?? 'image');
+        if (! in_array($mediaType, ['image', 'video'], true)) {
+            $mediaType = 'image';
+        }
+
+        if ($assetId <= 0) {
+            $this->sendOutbound(
+                $instance,
+                $conversation,
+                $phone,
+                $caption !== '' ? $caption : '⚠️ Falta subir la imagen/video en este nodo del flujo.',
+                'text',
+                $node->id
+            );
+
+            return;
+        }
+
+        $asset = \App\Models\MediaAsset::query()
+            ->where('tenant_id', $instance->tenant_id)
+            ->where('id', $assetId)
+            ->first();
+
+        if (! $asset) {
+            $this->sendOutbound(
+                $instance,
+                $conversation,
+                $phone,
+                '⚠️ El archivo del nodo ya no existe. Vuelve a subirlo en Flow Builder.',
+                'text',
+                $node->id
+            );
+
+            return;
+        }
+
+        try {
+            $response = $this->mediaService->sendMediaAsset(
+                $instance,
+                $this->resolveDestination($conversation, $phone),
+                $asset,
+                $caption,
+                $mediaType
+            );
+            $this->storeOutbound(
+                $instance,
+                $conversation,
+                $node->id,
+                $mediaType,
+                $caption !== '' ? $caption : '['.$mediaType.']',
+                $response
+            );
+        } catch (Throwable $e) {
+            Log::error('Fallo envío send_media', [
+                'error' => $e->getMessage(),
+                'asset_id' => $asset->id,
+                'media_type' => $mediaType,
+            ]);
+            $this->sendOutbound(
+                $instance,
+                $conversation,
+                $phone,
+                $caption !== ''
+                    ? $caption."\n\n_(No pude adjuntar el archivo; un asesor te lo reenvía.)_"
+                    : '⚠️ No pude enviar el archivo multimedia. Pide *humano* si lo necesitas.',
+                'text',
+                $node->id
+            );
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
     private function sendButtonsNode(
         WhatsappInstance $instance,
         Conversation $conversation,
@@ -562,12 +718,26 @@ class ConversationOrchestrator
         $text = (string) ($config['text'] ?? 'Elige una opción');
         $buttons = is_array($config['buttons'] ?? null) ? $config['buttons'] : [];
         $footer = is_string($config['footer'] ?? null) ? $config['footer'] : 'MarketLuna';
-        $preferNative = (bool) ($config['native_buttons'] ?? false);
+        $preferNative = (bool) ($config['native_buttons'] ?? false)
+            || $this->messengers->for($instance)->supportsNativeButtons();
         $destination = $this->resolveDestination($conversation, $phone);
 
-        // Baileys: los botones nativos suelen fallar en WhatsApp Web
-        // ("No se pudo cargar este mensaje"). Menú numerado = fiable.
-        if ($preferNative && $buttons !== []) {
+        $normalizedButtons = [];
+        foreach (array_slice($buttons, 0, 3) as $b) {
+            if (! is_array($b)) {
+                continue;
+            }
+            $id = (string) ($b['id'] ?? uniqid('btn_', true));
+            $label = (string) ($b['display'] ?? $b['label'] ?? $b['displayText'] ?? $id);
+            $normalizedButtons[] = [
+                'id' => $id,
+                'label' => $label,
+                'display' => $label,
+            ];
+        }
+
+        // Cloud API: botones nativos (máx. 3). Baileys: menú numerado salvo native_buttons.
+        if ($preferNative && $normalizedButtons !== []) {
             $lines = preg_split("/\r\n|\n|\r/", $text) ?: [$text];
             $titleLine = trim((string) ($lines[0] ?? 'Opciones'));
             $description = count($lines) > 1
@@ -575,26 +745,59 @@ class ConversationOrchestrator
                 : $text;
 
             try {
-                $response = $this->evolution->sendButtons(
-                    $instance->evolution_instance,
+                $response = $this->messengers->for($instance)->sendButtons(
+                    $instance,
                     $destination,
                     $titleLine !== '' ? $titleLine : 'Opciones',
                     $description !== '' ? $description : $text,
-                    $buttons,
+                    $normalizedButtons,
                     $footer
                 );
-                $this->storeOutbound($instance, $conversation, $node->id, 'buttons', $text, $response);
+                $this->storeOutbound(
+                    $instance,
+                    $conversation,
+                    $node->id,
+                    'buttons',
+                    $text,
+                    array_merge($response, ['buttons' => $normalizedButtons, 'footer' => $footer])
+                );
 
                 return;
             } catch (Throwable $e) {
-                Log::warning('sendButtons nativo falló, usando menú texto', ['error' => $e->getMessage()]);
+                Log::warning('sendButtons nativo falló', [
+                    'error' => $e->getMessage(),
+                    'integration' => $instance->integration,
+                ]);
+
+                // Meta Cloud: no degradar a números; guardar botones para UI / reintento
+                if ($instance->usesMetaCloud()) {
+                    $this->storeOutbound(
+                        $instance,
+                        $conversation,
+                        $node->id,
+                        'buttons',
+                        $text,
+                        [
+                            'preview' => true,
+                            'buttons' => $normalizedButtons,
+                            'footer' => $footer,
+                            'error' => $e->getMessage(),
+                        ]
+                    );
+
+                    return;
+                }
             }
         }
 
+        // Fallback Baileys / sin botones nativos: menú numerado
         $out = [rtrim($text), '', 'Responde con el *número* o el nombre:'];
         $i = 1;
         foreach (array_slice($buttons, 0, 6) as $b) {
-            $label = (string) ($b['label'] ?? $b['id'] ?? 'opción');
+            if (! is_array($b)) {
+                continue;
+            }
+            $label = (string) ($b['display'] ?? $b['label'] ?? $b['id'] ?? 'opción');
             $out[] = "*{$i})* {$label}";
             $i++;
         }
@@ -710,17 +913,17 @@ class ConversationOrchestrator
         FlowNode $node,
         array $config
     ): void {
-        $courseId = $config['course_id'] ?? null;
+        $courseId = $this->resolveSaleCourseId($instance, $conversation, $config);
         $course = $courseId
             ? Course::query()->where('tenant_id', $instance->tenant_id)->with('paymentQr')->find($courseId)
-            : Course::query()->where('tenant_id', $instance->tenant_id)->where('is_active', true)->with('paymentQr')->first();
+            : null;
 
         if (! $course) {
             $this->sendOutbound(
                 $instance,
                 $conversation,
                 $phone,
-                'Aún no hay un curso configurado para cobrar.',
+                'Aún no hay un producto configurado para cobrar. Crea uno en Productos.',
                 'text',
                 $node->id
             );
@@ -766,8 +969,7 @@ class ConversationOrchestrator
         if ($wantsQrImage && $qrAsset) {
             try {
                 $response = $this->mediaService->sendImage(
-                    $this->evolution,
-                    $instance->evolution_instance,
+                    $instance,
                     $this->resolveDestination($conversation, $phone),
                     $qrAsset,
                     '📲 Escanea este QR para pagar'
@@ -906,12 +1108,12 @@ class ConversationOrchestrator
         FlowNode $node,
         array $config
     ): void {
-        $courseId = $config['course_id'] ?? data_get($conversation->context, 'course_id');
+        $courseId = $this->resolveSaleCourseId($instance, $conversation, $config);
         $course = $courseId
-            ? Course::query()->find($courseId)
-            : Course::query()->where('tenant_id', $instance->tenant_id)->where('is_active', true)->first();
+            ? Course::query()->where('tenant_id', $instance->tenant_id)->find($courseId)
+            : null;
 
-        $url = data_get($course?->delivery_payload, 'url', 'https://ejemplo.com/curso');
+        $url = data_get($course?->delivery_payload, 'url', 'https://ejemplo.com/producto');
         $success = (string) ($config['success_text'] ?? '¡Listo! Aquí tienes tu acceso:');
         $text = "{$success}\n\n🔗 {$url}";
 
@@ -951,13 +1153,14 @@ class ConversationOrchestrator
         $destination = $this->resolveDestination($conversation, $phone);
 
         try {
-            $response = $this->evolution->sendText($instance->evolution_instance, $destination, $text);
+            $response = $this->messengers->for($instance)->sendText($instance, $destination, $text);
             $this->storeOutbound($instance, $conversation, $nodeId, $type, $text, $response);
         } catch (Throwable $e) {
-            Log::error('Evolution sendText failed', [
+            Log::error('WhatsApp sendText failed', [
                 'error' => $e->getMessage(),
                 'phone' => $phone,
                 'destination' => $destination,
+                'integration' => $instance->integration,
             ]);
             Message::create([
                 'tenant_id' => $instance->tenant_id,
