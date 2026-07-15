@@ -2,9 +2,9 @@
 
 namespace Database\Seeders;
 
-/*use App\Models\Tenant;*/
+use App\Models\Tenant;
 use App\Models\User;
-/*use App\Models\WhatsappInstance;*/
+use App\Models\WhatsappInstance;
 use App\Services\Tenancy\TenantCatalogBootstrapService;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Str;
@@ -13,7 +13,7 @@ class DatabaseSeeder extends Seeder
 {
     public function run(): void
     {
-       /* $tenant = Tenant::create([
+       $tenant = Tenant::create([
             'uuid' => (string) Str::uuid(),
             'name' => 'Academia Personal',
             'slug' => 'academia-personal',
@@ -26,12 +26,12 @@ class DatabaseSeeder extends Seeder
                 'brand' => 'MarketLuna',
                 'ai_name' => 'Luna',
             ],
-        ]);*/
+        ]);
 
         User::create([
-            'tenant_id' => 1,
+            'tenant_id' => $tenant->id,
             'name' => 'Juan Huanca',
-            'email' => 'jhuanca617@gmail.com',
+            'email' => 'huancajuan@gmail.com',
             'password' => 'jhuanca1997@-luna',
             'role' => 'owner',
             'is_active' => true,
@@ -40,8 +40,8 @@ class DatabaseSeeder extends Seeder
             'email_verified_at' => now(),
         ]);
 
-       /* WhatsappInstance::create([
-            'tenant_id' => 1,
+       WhatsappInstance::create([
+            'tenant_id' => $tenant->id,
             'name' => 'Principal',
             'evolution_instance' => 'academia-ventas',
             'evolution_apikey' => null,
@@ -49,8 +49,8 @@ class DatabaseSeeder extends Seeder
             'status' => 'disconnected',
             'webhook_secret' => Str::random(48),
             'meta' => [],
-        ]);*/
+        ]);
 
-        /*app(TenantCatalogBootstrapService::class)->bootstrapIfEmpty($tenant);*/
+        app(TenantCatalogBootstrapService::class)->bootstrapIfEmpty($tenant);
     }
 }
