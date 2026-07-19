@@ -273,6 +273,7 @@ class WhatsappInstanceController extends Controller
                     ->orderBy('id')
                     ->limit(80)
                     ->get(['id', 'direction', 'type', 'body', 'payload', 'created_at', 'status'])
+                    ->map(fn (Message $m) => $this->presentMessage($m))
                     ->all();
             }
         }
@@ -370,6 +371,30 @@ class WhatsappInstanceController extends Controller
             'last_connected_at' => $instance->last_connected_at,
             'created_at' => $instance->created_at,
             'updated_at' => $instance->updated_at,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function presentMessage(Message $message): array
+    {
+        $payload = is_array($message->payload) ? $message->payload : [];
+        $mediaAssetId = (int) (
+            $payload['media_asset_id']
+            ?? data_get($payload, 'receipt_media_asset_id')
+            ?? 0
+        );
+
+        return [
+            'id' => $message->id,
+            'direction' => $message->direction,
+            'type' => $message->type,
+            'body' => $message->body,
+            'payload' => $payload,
+            'created_at' => $message->created_at,
+            'status' => $message->status,
+            'media_asset_id' => $mediaAssetId > 0 ? $mediaAssetId : null,
         ];
     }
 }

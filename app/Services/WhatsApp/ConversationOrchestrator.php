@@ -632,9 +632,14 @@ class ConversationOrchestrator
         FlowNode $node,
         array $config
     ): void {
-        $assetId = (int) ($config['media_asset_id'] ?? 0);
+        $assetId = (int) (
+            $config['media_asset_id']
+            ?? $config['mediaAssetId']
+            ?? $config['asset_id']
+            ?? 0
+        );
         $caption = trim((string) ($config['caption'] ?? $config['text'] ?? ''));
-        $mediaType = (string) ($config['media_type'] ?? 'image');
+        $mediaType = (string) ($config['media_type'] ?? $config['mediaType'] ?? 'image');
         if (! in_array($mediaType, ['image', 'video'], true)) {
             $mediaType = 'image';
         }
@@ -678,6 +683,9 @@ class ConversationOrchestrator
                 $caption,
                 $mediaType
             );
+            $response['media_asset_id'] = $asset->id;
+            $response['media_type'] = $mediaType;
+            $response['preview'] = true;
             $this->storeOutbound(
                 $instance,
                 $conversation,
@@ -691,6 +699,8 @@ class ConversationOrchestrator
                 'error' => $e->getMessage(),
                 'asset_id' => $asset->id,
                 'media_type' => $mediaType,
+                'path' => $asset->path,
+                'disk' => $asset->disk,
             ]);
             $this->sendOutbound(
                 $instance,
@@ -974,6 +984,9 @@ class ConversationOrchestrator
                     $qrAsset,
                     '📲 Escanea este QR para pagar'
                 );
+                $response['media_asset_id'] = $qrAsset->id;
+                $response['media_type'] = 'image';
+                $response['preview'] = true;
                 $this->storeOutbound($instance, $conversation, $node->id, 'image', '[qr-pago]', $response);
             } catch (Throwable $e) {
                 Log::error('Fallo envío QR imagen', [

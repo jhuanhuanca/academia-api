@@ -316,6 +316,24 @@ class WhatsAppMediaService
         return $variants;
     }
 
+    /**
+     * Guarda un UploadedFile sin pasar por base64 (más fiable para videos).
+     */
+    public function storeUploadedFile(
+        int $tenantId,
+        \Illuminate\Http\UploadedFile $file,
+        string $prefix,
+        ?string $mime = null
+    ): MediaAsset {
+        $mime = $mime ?: ($file->getMimeType() ?: 'application/octet-stream');
+        $binary = file_get_contents($file->getRealPath());
+        if ($binary === false || $binary === '') {
+            throw new \RuntimeException('No se pudo leer el archivo subido');
+        }
+
+        return $this->storeBinary($tenantId, $binary, $prefix, $mime);
+    }
+
     public function storeFromBase64(
         int $tenantId,
         string $base64,
@@ -334,7 +352,15 @@ class WhatsAppMediaService
             throw new \RuntimeException('Base64 de media inválido');
         }
 
-        $mime = $mime ?: 'image/jpeg';
+        return $this->storeBinary($tenantId, $binary, $prefix, $mime ?: 'image/jpeg');
+    }
+
+    private function storeBinary(
+        int $tenantId,
+        string $binary,
+        string $prefix,
+        string $mime
+    ): MediaAsset {
         $ext = match (true) {
             str_contains($mime, 'png') => 'png',
             str_contains($mime, 'pdf') => 'pdf',
@@ -368,6 +394,10 @@ class WhatsAppMediaService
         $path = sprintf('%s/%d/%d.%s', $folder, $tenantId, $asset->id, $ext);
         $this->putPublicBinary($path, $binary);
         $asset->update(['path' => $path]);
+
+        if (! Storage::disk('public')->exists($path)) {
+            throw new \RuntimeException('El archivo no quedó guardado en storage ('.$path.')');
+        }
 
         return $asset->fresh();
     }
@@ -627,24 +657,32 @@ class WhatsAppMediaService
 
     private function findPublicPaymentQrPath(int $tenantId, int $assetId): ?string
     {
-        foreach (['jpg', 'jpeg', 'png', 'webp'] as $ext) {
-            $candidate = sprintf('payment-qr/%d/%d.%s', $tenantId, $assetId, $ext);
+        return $this->findPublicAssetPath('payment-qr', $tenantId, $assetId);
+    }
+
+    private function findPublicAssetPath(string $folder, int $tenantId, int $assetId): ?string
+    {
+        $exts = ['jpg', 'jpeg', 'png', 'webp', 'mp4', '3gp', 'mov', 'webm', 'pdf'];
+        foreach ($exts as $ext) {
+            $candidate = sprintf('%s/%d/%d.%s', $folder, $tenantId, $assetId, $ext);
             if (Storage::disk('public')->exists($candidate)) {
                 return $candidate;
             }
         }
 
-        // Cualquier archivo payment-qr/{tenant}/{id}*
-        $dir = sprintf('payment-qr/%d', $tenantId);
-        if (! Storage::disk('public')->exists($dir)) {
-            return null;
-        }
-
-        foreach (Storage::disk('public')->files($dir) as $file) {
-            $base = pathinfo($file, PATHINFO_FILENAME);
-            if ($base === (string) $assetId || str_starts_with($base, $assetId.'_')) {
-                return $file;
+        $dir = sprintf('%s/%d', $folder, $tenantId);
+        try {
+            if (! Storage::disk('public')->exists($dir)) {
+                return null;
             }
+            foreach (Storage::disk('public')->files($dir) as $file) {
+                $base = pathinfo($file, PATHINFO_FILENAME);
+                if ($base === (string) $assetId || str_starts_with($base, $assetId.'_')) {
+                    return $file;
+                }
+            }
+        } catch (Throwable) {
+            return null;
         }
 
         return null;
@@ -673,7 +711,22 @@ class WhatsAppMediaService
             }
         }
 
-        // 3) Path local antiguo media/...
+        // 3) flow-media / uploads / receipts por id
+        foreach (['flow-media', 'uploads', 'receipts', 'payment-qr'] as $folder) {
+            $found = $this->findPublicAssetPath($folder, $asset->tenant_id, $asset->id);
+            if ($found) {
+                $binary = Storage::disk('public')->get($found);
+                if (is_string($binary) && $binary !== '') {
+                    if ($asset->path !== $found) {
+                        $asset->forceFill(['disk' => 'public', 'path' => $found])->save();
+                    }
+
+                    return $binary;
+                }
+            }
+        }
+
+        // 4) Path local antiguo media/...
         $legacyGuess = [
             $asset->path,
         ];

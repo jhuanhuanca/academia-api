@@ -134,7 +134,7 @@ class FlowController extends Controller
                     'node_key' => $node['node_key'],
                     'type' => $node['type'],
                     'name' => $node['name'],
-                    'config' => $node['config'] ?? [],
+                    'config' => $this->normalizeNodeConfig($node['type'], $node['config'] ?? []),
                     'position_x' => $node['position_x'] ?? 0,
                     'position_y' => $node['position_y'] ?? 0,
                 ]);
@@ -189,5 +189,34 @@ class FlowController extends Controller
     private function assertTenant(Request $request, int $tenantId): void
     {
         abort_if($request->user()->tenant_id !== $tenantId, 404);
+    }
+
+    /**
+     * Asegura IDs de media como enteros para que el orquestador no pierda el archivo.
+     *
+     * @param  array<string, mixed>  $config
+     * @return array<string, mixed>
+     */
+    private function normalizeNodeConfig(string $type, array $config): array
+    {
+        foreach (['media_asset_id', 'qr_media_asset_id', 'course_id'] as $key) {
+            if (! array_key_exists($key, $config) || $config[$key] === null || $config[$key] === '') {
+                continue;
+            }
+            $config[$key] = (int) $config[$key];
+            if ($config[$key] <= 0) {
+                $config[$key] = null;
+            }
+        }
+
+        if ($type === 'send_media') {
+            $mediaType = (string) ($config['media_type'] ?? 'image');
+            $config['media_type'] = in_array($mediaType, ['image', 'video'], true) ? $mediaType : 'image';
+            if (! empty($config['media_asset_id']) && empty($config['caption']) && ! empty($config['text'])) {
+                $config['caption'] = $config['text'];
+            }
+        }
+
+        return $config;
     }
 }

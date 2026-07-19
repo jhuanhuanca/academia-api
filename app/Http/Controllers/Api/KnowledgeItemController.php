@@ -47,6 +47,7 @@ class KnowledgeItemController extends Controller
             'title' => ['sometimes', 'string', 'max:180'],
             'content' => ['sometimes', 'string'],
             'tags' => ['nullable', 'array'],
+            'tags.*' => ['string', 'max:40'],
             'course_id' => ['nullable', 'integer'],
             'is_active' => ['nullable', 'boolean'],
         ]);

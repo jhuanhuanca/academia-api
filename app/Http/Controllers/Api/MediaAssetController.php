@@ -13,33 +13,51 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class MediaAssetController extends Controller
 {
+    private const ALLOWED_MIMES = [
+        'image/jpeg',
+        'image/jpg',
+        'image/png',
+        'image/webp',
+        'application/pdf',
+        'video/mp4',
+        'video/3gpp',
+        'video/webm',
+        'video/quicktime',
+    ];
+
     public function store(Request $request, WhatsAppMediaService $mediaService): JsonResponse
     {
         $data = $request->validate([
-            'file' => [
-                'required',
-                'file',
-                'max:20480', // 20 MB (videos cortos para WhatsApp)
-                'mimes:jpg,jpeg,png,webp,pdf,mp4,3gp,mov,webm',
-            ],
+            'file' => ['required', 'file', 'max:20480'], // 20 MB
             'purpose' => ['nullable', 'string', 'max:40'],
         ]);
 
         $file = $data['file'];
-        $mime = $file->getMimeType() ?: 'application/octet-stream';
-        $binary = file_get_contents($file->getRealPath());
-        if ($binary === false) {
-            return response()->json(['message' => 'No se pudo leer el archivo'], 422);
+        $mime = strtolower((string) ($file->getMimeType() ?: 'application/octet-stream'));
+        $ext = strtolower((string) $file->getClientOriginalExtension());
+
+        $allowedByExt = in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'pdf', 'mp4', '3gp', 'mov', 'webm'], true);
+        $allowedByMime = in_array($mime, self::ALLOWED_MIMES, true)
+            || str_starts_with($mime, 'image/')
+            || str_starts_with($mime, 'video/');
+
+        if (! $allowedByExt && ! $allowedByMime) {
+            return response()->json([
+                'message' => 'Formato no permitido. Usa JPG, PNG, WebP, PDF o MP4/3GP/MOV.',
+            ], 422);
         }
 
-        $purpose = $data['purpose'] ?? 'upload';
-        if (str_starts_with((string) $mime, 'video/') && $purpose === 'upload') {
+        $purpose = (string) ($data['purpose'] ?? 'upload');
+        if (str_starts_with($mime, 'video/') && ($purpose === '' || $purpose === 'upload')) {
+            $purpose = 'flow-media';
+        }
+        if (in_array($purpose, ['flow_media', 'flowmedia'], true)) {
             $purpose = 'flow-media';
         }
 
-        $asset = $mediaService->storeFromBase64(
+        $asset = $mediaService->storeUploadedFile(
             $request->user()->tenant_id,
-            'data:'.$mime.';base64,'.base64_encode($binary),
+            $file,
             $purpose,
             $mime
         );
@@ -49,6 +67,7 @@ class MediaAssetController extends Controller
                 'id' => $asset->id,
                 'mime' => $asset->mime,
                 'size_bytes' => $asset->size_bytes,
+                'path' => $asset->path,
                 'url' => url('/api/media-assets/'.$asset->id),
             ],
         ], 201);
@@ -69,7 +88,10 @@ class MediaAssetController extends Controller
         return Storage::disk($mediaAsset->disk)->response(
             $mediaAsset->path,
             $name,
-            ['Content-Type' => $mediaAsset->mime]
+            [
+                'Content-Type' => $mediaAsset->mime ?: 'application/octet-stream',
+                'Cache-Control' => 'private, max-age=3600',
+            ]
         );
     }
 }
