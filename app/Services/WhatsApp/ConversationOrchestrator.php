@@ -111,12 +111,60 @@ class ConversationOrchestrator
             $current = $this->resolveFlowNode($flow, $conversation->current_node_id)
                 ?? $this->resolveStartNode($flow);
 
-            // Conversación trabada (pago/handoff) + saludo → reiniciar flujo
-            // Nunca reiniciar si está en menú de botones esperando una opción (1, 2, qr…)
             $bodyText = (string) ($incoming['body'] ?? '');
+
+            // Ya está con un humano: guardar el mensaje y NO responder (salvo reinicio).
+            if (
+                $conversation->status === 'handed_off'
+                || ($current && $current->type === 'handoff')
+            ) {
+                if (
+                    $this->looksLikeRestart($bodyText)
+                    && ! $this->looksLikeMenuChoice($bodyText)
+                ) {
+                    $conversation->forceFill([
+                        'status' => 'closed',
+                        'closed_at' => now(),
+                        'current_node_id' => null,
+                        'context' => array_merge($conversation->context ?? [], [
+                            'handed_off' => false,
+                            'bot_paused' => false,
+                        ]),
+                    ])->save();
+
+                    $conversation = $this->resolveConversation($instance, $lead);
+                    if (! $conversation) {
+                        return ['skipped' => true, 'reason' => 'no_flow_after_restart'];
+                    }
+
+                    return $this->runFromStart($instance, $conversation, $flow, $lead, $replyTo);
+                }
+
+                Log::info('Bot silenciado: conversación con humano', [
+                    'conversation_id' => $conversation->id,
+                    'lead_id' => $lead->id,
+                ]);
+
+                return [
+                    'ok' => true,
+                    'action' => 'awaiting_human',
+                    'bot_silenced' => true,
+                ];
+            }
+
+            // Pedido explícito de humano (texto libre) → pausar bot.
+            if (
+                ($incoming['type'] ?? 'text') !== 'button_reply'
+                && $this->looksLikeHumanRequest($bodyText)
+            ) {
+                return $this->transferToHuman($instance, $conversation, $flow, $lead, $phone, $replyTo);
+            }
+
+            // Conversación trabada en pago + saludo → reiniciar flujo
+            // Nunca reiniciar si está en menú de botones esperando una opción (1, 2, qr…)
             if (
                 $current
-                && in_array($conversation->status, ['waiting_payment', 'handed_off'], true)
+                && $conversation->status === 'waiting_payment'
                 && ! ($current->type === 'buttons' || $current->type === 'list')
                 && $this->looksLikeRestart($bodyText)
                 && ! $this->looksLikeMenuChoice($bodyText)
@@ -157,6 +205,11 @@ class ConversationOrchestrator
                 $triggerType = 'button';
                 $triggerKey = (string) $incoming['button_id'];
                 $this->rememberSelectedProduct($conversation, $triggerKey);
+
+                // Botón "humano" / handoff aunque no haya edge configurado
+                if ($this->isHumanButtonKey($triggerKey)) {
+                    return $this->transferToHuman($instance, $conversation, $flow, $lead, $phone, $replyTo);
+                }
             } elseif (($incoming['type'] ?? '') === 'list_reply' && ! empty($incoming['list_id'])) {
                 $triggerType = 'list';
                 $triggerKey = (string) $incoming['list_id'];
@@ -169,6 +222,9 @@ class ConversationOrchestrator
                     $triggerType = 'button';
                     $triggerKey = $matched;
                     $this->rememberSelectedProduct($conversation, $matched);
+                    if ($this->isHumanButtonKey($matched) || $this->looksLikeHumanRequest($bodyText)) {
+                        return $this->transferToHuman($instance, $conversation, $flow, $lead, $phone, $replyTo);
+                    }
                 } else {
                     $this->sendOutbound(
                         $instance,
@@ -610,16 +666,124 @@ class ConversationOrchestrator
                 $node->id
             ),
             'deliver_course' => $this->deliverCourse($instance, $conversation, $lead, $phone, $node, $config),
-            'handoff' => $this->sendOutbound(
-                $instance,
-                $conversation,
-                $phone,
-                (string) ($config['text'] ?? 'Te derivo con una persona del equipo. En breve te responden.'),
-                'text',
-                $node->id
-            ),
+            'handoff' => $this->activateHandoff($instance, $conversation, $phone, $node, $config),
             default => null,
         };
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    private function activateHandoff(
+        WhatsappInstance $instance,
+        Conversation $conversation,
+        string $phone,
+        FlowNode $node,
+        array $config
+    ): void {
+        $text = (string) ($config['text'] ?? 'Te derivo con una persona del equipo. En breve te responden por aquí. El asistente automático queda en pausa.');
+
+        $conversation->forceFill([
+            'status' => 'handed_off',
+            'current_node_id' => $node->id,
+            'context' => array_merge($conversation->context ?? [], [
+                'handed_off' => true,
+                'bot_paused' => true,
+                'handed_off_at' => now()->toIso8601String(),
+            ]),
+        ])->save();
+
+        $this->sendOutbound($instance, $conversation, $phone, $text, 'text', $node->id);
+    }
+
+    /**
+     * Pausa el bot y deja la conversación para un agente humano.
+     *
+     * @return array<string, mixed>
+     */
+    private function transferToHuman(
+        WhatsappInstance $instance,
+        Conversation $conversation,
+        Flow $flow,
+        Lead $lead,
+        string $phone,
+        string $replyTo
+    ): array {
+        $handoff = FlowNode::query()
+            ->where('flow_id', $flow->id)
+            ->where('type', 'handoff')
+            ->orderBy('id')
+            ->first();
+
+        if ($handoff) {
+            return $this->executeNodeChain(
+                $instance,
+                $conversation,
+                $flow,
+                $lead,
+                $replyTo !== '' ? $replyTo : $phone,
+                $handoff
+            );
+        }
+
+        $conversation->forceFill([
+            'status' => 'handed_off',
+            'context' => array_merge($conversation->context ?? [], [
+                'handed_off' => true,
+                'bot_paused' => true,
+                'handed_off_at' => now()->toIso8601String(),
+            ]),
+        ])->save();
+
+        $this->sendOutbound(
+            $instance,
+            $conversation,
+            $phone,
+            'Perfecto. Te derivo con una persona del equipo. En breve te responden por aquí. El asistente automático queda en pausa. Si quieres volver al menú, escribe *hola* o *menú*.',
+            'text',
+            $conversation->current_node_id
+        );
+
+        return ['ok' => true, 'action' => 'handed_off', 'bot_silenced' => true];
+    }
+
+    private function looksLikeHumanRequest(string $body): bool
+    {
+        $text = mb_strtolower(trim($body));
+        if ($text === '') {
+            return false;
+        }
+
+        $keys = [
+            'humano',
+            'asesor',
+            'agente',
+            'operador',
+            'hablar con humano',
+            'hablar con un humano',
+            'hablar con alguien',
+            'quiero un humano',
+            'persona real',
+            'atencion humana',
+            'atención humana',
+            'atencion al cliente',
+            'atención al cliente',
+        ];
+
+        foreach ($keys as $key) {
+            if ($text === $key || str_contains($text, $key)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isHumanButtonKey(string $key): bool
+    {
+        $k = mb_strtolower(trim($key));
+
+        return in_array($k, ['human', 'humano', 'handoff', 'asesor', 'agente', 'operador'], true);
     }
 
     /**

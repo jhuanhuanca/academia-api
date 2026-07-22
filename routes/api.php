@@ -74,6 +74,9 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/conversations', [ConversationController::class, 'index']);
     Route::get('/conversations/{conversation}', [ConversationController::class, 'show']);
+    Route::post('/conversations/{conversation}/reply', [ConversationController::class, 'reply']);
+    Route::post('/conversations/{conversation}/take', [ConversationController::class, 'take']);
+    Route::post('/conversations/{conversation}/release', [ConversationController::class, 'release']);
     Route::get('/sales', [SalesController::class, 'index']);
     Route::post('/sales/{sale}/confirm-payment', [SalesController::class, 'confirmPayment']);
     Route::get('/media-assets/{mediaAsset}', [MediaAssetController::class, 'show']);

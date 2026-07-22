@@ -57,4 +57,9 @@ class Conversation extends Model
     {
         return $this->hasMany(Message::class);
     }
+
+    public function assignedUser(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'assigned_user_id');
+    }
 }
